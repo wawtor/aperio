@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install tools
+        run: |
+          pip install pyinstaller hidapi
+          choco install innosetup --yes --no-progress
+
+      - name: Build daemon
+        working-directory: daemon
+        run: cargo build --release
+
+      - name: Build setup GUI
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --icon=aperio.ico
+          --name=aperio_setup
+          --hidden-import=hid
+          aperio.py
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" /DMyAppVersion=$version installer\aperio.iss
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer\Output\Aperio-*-Setup.exe
+          generate_release_notes: true

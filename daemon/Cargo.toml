@@ -1,0 +1,28 @@
+[package]
+name = "aperio"
+version = "0.1.0"
+edition = "2021"
+description = "Aperio — EMEET Pixy camera daemon: camera open -> aim+track, camera close -> privacy sleep"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,9 @@
+Aperio
+Copyright 2026 wawtor (https://github.com/wawtor/aperio)
+
+This project includes original reverse-engineering research of the EMEET Pixy
+AI gimbal webcam HID protocol, conducted independently by the author. Any
+derivative work, port, or integration that builds on this protocol research
+must retain this notice and credit the original work.
+
+Source: https://github.com/wawtor/aperio
