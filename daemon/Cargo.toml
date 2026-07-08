@@ -1,6 +1,6 @@
 [package]
 name = "aperio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Aperio — EMEET Pixy camera daemon: camera open -> aim+track, camera close -> privacy sleep"
 

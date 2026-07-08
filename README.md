@@ -90,6 +90,7 @@ python aperio.py
 - Or **type coordinates** directly (Pan ±150°, Tilt ±90°)
 - Toggle **AI Tracking** — camera follows your face when in use
 - Toggle **Auto Privacy** — lens parks down when no app is using the camera
+- Toggle **Local API server** — control the camera from your own apps (off by default)
 - Click **Save**, then close
 
 ### 3. Install the daemon
@@ -99,7 +100,16 @@ install.bat
 ```
 
 This registers `aperio.exe` as a Windows scheduled task that starts at logon
-and runs silently in the background. To remove it run `uninstall.bat`.
+and runs silently in the background. It also puts the `aperio` command on your
+PATH, so from any new PowerShell or cmd window you can reopen the setup GUI
+with just:
+
+```
+aperio
+```
+
+(The Windows installer from the Releases page does the same.)
+To remove everything run `uninstall.bat`.
 
 ---
 
@@ -116,6 +126,35 @@ camera's privacy timer, so any keepalive would prevent it from ever sleeping.
 
 ---
 
+## Local API
+
+Aperio can expose a small HTTP API so your own applications and scripts can
+drive the camera. It is **off by default** — enable the *Local API server*
+toggle in the setup GUI (`aperio`) and save. The daemon then listens on
+`127.0.0.1:4750` (loopback only; nothing is reachable from the network).
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/status` | GET | Daemon info, camera presence, saved settings (JSON) |
+| `/move?pan=X&tilt=Y` | POST | Absolute move in degrees (either param optional) |
+| `/move_rel?pan=X&tilt=Y` | POST | Relative move in degrees |
+| `/mode?value=follow\|standard\|privacy` | POST | Set device mode |
+| `/home` | POST | Return to the saved startup position |
+
+Pan is clamped to ±150°, tilt to ±90°. Examples:
+
+```
+curl http://127.0.0.1:4750/status
+curl -X POST "http://127.0.0.1:4750/move?pan=30&tilt=-10"
+curl -X POST "http://127.0.0.1:4750/mode?value=follow"
+curl -X POST http://127.0.0.1:4750/home
+```
+
+Turning the toggle off closes the port. The toggle is applied when the daemon
+starts and re-checked on every camera open/close event.
+
+---
+
 ## Files
 
 | File | Purpose |
@@ -123,8 +162,8 @@ camera's privacy timer, so any keepalive would prevent it from ever sleeping.
 | `aperio.py` | Setup GUI — set startup position, toggle settings, save |
 | `aperio.exe` | Background daemon (build from `daemon/`) |
 | `daemon/` | Rust source for the daemon |
-| `install.bat` | Register daemon as a Windows logon task |
-| `uninstall.bat` | Remove the scheduled task |
+| `install.bat` | Register daemon as a logon task + add the `aperio` command to PATH |
+| `uninstall.bat` | Remove the scheduled task, `aperio` command, and PATH entry |
 | `research/` | Protocol research, diagnostic tool, per-camera data |
 
 Config files are created by `aperio.py` on first save and live alongside the exe:
@@ -134,6 +173,8 @@ Config files are created by `aperio.py` on first save and live alongside the exe
 | `start_pos.txt` | Startup pan/tilt in degrees |
 | `last_track.state` | AI tracking on/off (1/0) |
 | `auto_privacy.state` | Auto privacy on/off (1/0) |
+| `joystick_invert.state` | Invert joystick on/off (1/0) |
+| `api_server.state` | Local API server on/off (1/0, default off) |
 
 ---
 

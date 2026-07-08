@@ -21,8 +21,19 @@ if not exist "%EXE%" (
 )
 
 schtasks /Create /TN "Aperio" /TR "\"%EXE%\"" /SC ONLOGON /RL LIMITED /F
+
+REM Create the `aperio` command shim and put it on the user PATH
+if not exist "%~dp0bin" mkdir "%~dp0bin"
+echo @echo off> "%~dp0bin\aperio.cmd"
+echo start "" pythonw "%%~dp0..\aperio.py" %%*>> "%~dp0bin\aperio.cmd"
+powershell -NoProfile -Command ^
+  "$b = '%~dp0bin'; $p = [Environment]::GetEnvironmentVariable('Path','User');" ^
+  "if ((';' + $p + ';') -notlike ('*;' + $b + ';*')) {" ^
+  "  [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $b), 'User') }"
+
 echo.
 echo Aperio daemon installed ^(runs at logon^).
+echo   Setup GUI  : aperio   ^(from any new terminal^)
 echo   Start now  : schtasks /Run /TN Aperio
 echo   Stop now   : taskkill /IM aperio.exe /F
 echo   Log file   : %~dp0aperio.log

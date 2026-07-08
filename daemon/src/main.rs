@@ -10,12 +10,20 @@
 //! Wake/sleep are detected by the NEWEST LastUsedTimeStart / LastUsedTimeStop
 //! advancing -- robust to stale/orphaned "in-use" entries (e.g. old Discord versions).
 //!
+//! Optional local API server (off by default, toggled from the setup GUI via
+//! api_server.state): HTTP on 127.0.0.1:4750 so user applications can drive
+//! the camera. See the "local API server" section for endpoints.
+//!
 //! Usage:
 //!   aperio            run the daemon (event loop)
 //!   aperio active     one-shot: aim to start + enable Follow (test)
 //!   aperio inactive   one-shot: park to Privacy (test)
 //!   aperio find       print the resolved camera HID device path (test)
 
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{thread, fs, io::Write, path::PathBuf};
 
@@ -45,6 +53,9 @@ const WEBCAM: &str =
 // Defaults if start_pos.txt is missing (pan, tilt in degrees).
 const DEF_PAN: f32 = 7.5;
 const DEF_TILT: f32 = -15.9;
+
+// Local API server (opt-in via api_server.state, loopback only).
+const API_PORT: u16 = 4750;
 
 // ---- small helpers ----------------------------------------------------------
 
@@ -112,6 +123,14 @@ fn read_auto_privacy() -> bool {
     true
 }
 
+/// Read api_server.state: "1" = run the local API server. Defaults to false (off).
+fn read_api_enabled() -> bool {
+    if let Ok(s) = fs::read_to_string(exe_dir().join("api_server.state")) {
+        return s.trim() == "1";
+    }
+    false
+}
+
 // ---- HID protocol -----------------------------------------------------------
 
 fn frame(g: u8, p: u8, i: u8, payload: &[u8]) -> [u8; 32] {
@@ -132,6 +151,12 @@ fn motor_pos(axis: u8, deg: f32) -> [u8; 32] {
     let mut pl = vec![axis];
     pl.extend_from_slice(&deg.to_le_bytes());
     frame(0x63, 0x01, 0x00, &pl) // SET_MOTOR_POS
+}
+
+fn motor_rel(axis: u8, deg: f32) -> [u8; 32] {
+    let mut pl = vec![axis];
+    pl.extend_from_slice(&deg.to_le_bytes());
+    frame(0x63, 0x01, 0x19, &pl) // MOVE_MOTOR_REL
 }
 
 fn device_mode(m: u8) -> [u8; 32] {
@@ -176,8 +201,12 @@ fn find_pixy() -> Option<Vec<u16>> {
     }
 }
 
+// Serializes device access between the event loop and the API server thread.
+static SEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// Open the device and write each 32-byte frame (with settle delays between).
 fn send(frames: &[[u8; 32]]) -> bool {
+    let _guard = SEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = match find_pixy() {
         Some(p) => p,
         None => {
@@ -315,6 +344,164 @@ fn scan() -> (u64, u64) {
     (ms, mc)
 }
 
+// ---- local API server (opt-in) -----------------------------------------------
+//
+// Minimal HTTP/1.1 endpoint on 127.0.0.1:API_PORT so user applications can
+// drive the camera. Enabled only while api_server.state contains "1".
+//
+//   GET  /status                          daemon + config info (JSON)
+//   POST /move?pan=X&tilt=Y               absolute move (deg, either optional)
+//   POST /move_rel?pan=X&tilt=Y           relative move (deg, either optional)
+//   POST /mode?value=follow|standard|privacy
+//   POST /home                            go to the saved startup position
+
+struct ApiServer {
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+fn start_api_server() -> Option<ApiServer> {
+    let listener = match TcpListener::bind(("127.0.0.1", API_PORT)) {
+        Ok(l) => l,
+        Err(e) => {
+            log(&format!("api: bind 127.0.0.1:{} failed: {}", API_PORT, e));
+            return None;
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = thread::spawn(move || {
+        log(&format!("api: listening on 127.0.0.1:{}", API_PORT));
+        for conn in listener.incoming() {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(mut c) = conn {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+                handle_client(&mut c);
+            }
+        }
+        log("api: stopped");
+    });
+    Some(ApiServer { stop, handle })
+}
+
+fn stop_api_server(s: ApiServer) {
+    s.stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(("127.0.0.1", API_PORT)); // unblock accept()
+    let _ = s.handle.join();
+}
+
+fn respond(c: &mut TcpStream, status: &str, body: &str) {
+    let _ = c.write_all(
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    );
+}
+
+fn query_f32(query: &str, key: &str) -> Option<f32> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+fn query_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+fn handle_client(c: &mut TcpStream) {
+    let mut line = String::new();
+    if BufReader::new(&mut *c).read_line(&mut line).is_err() {
+        return;
+    }
+    let mut parts = line.split_whitespace();
+    let (method, target) = match (parts.next(), parts.next()) {
+        (Some(m), Some(t)) => (m, t),
+        _ => return,
+    };
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+
+    match (method, path) {
+        ("GET", "/status") => {
+            let (pan, tilt) = read_start_pos();
+            let body = format!(
+                "{{\"name\":\"aperio\",\"camera_found\":{},\"tracking\":{},\"auto_privacy\":{},\"start_pos\":{{\"pan\":{:.2},\"tilt\":{:.2}}}}}",
+                find_pixy().is_some(),
+                read_tracking(),
+                read_auto_privacy(),
+                pan,
+                tilt
+            );
+            respond(c, "200 OK", &body);
+        }
+        ("POST", "/move") | ("POST", "/move_rel") => {
+            let rel = path == "/move_rel";
+            let pan = query_f32(query, "pan");
+            let tilt = query_f32(query, "tilt");
+            if pan.is_none() && tilt.is_none() {
+                respond(c, "400 Bad Request", "{\"ok\":false,\"error\":\"pan and/or tilt required\"}");
+                return;
+            }
+            let mut frames: Vec<[u8; 32]> = Vec::new();
+            if let Some(p) = pan {
+                let p = p.clamp(-150.0, 150.0);
+                frames.push(if rel { motor_rel(1, p) } else { motor_pos(1, p) });
+            }
+            if let Some(t) = tilt {
+                let t = t.clamp(-90.0, 90.0);
+                frames.push(if rel { motor_rel(2, t) } else { motor_pos(2, t) });
+            }
+            log(&format!("api: {} pan={:?} tilt={:?}", path, pan, tilt));
+            if send(&frames) {
+                respond(c, "200 OK", "{\"ok\":true}");
+            } else {
+                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
+            }
+        }
+        ("POST", "/mode") => {
+            let m = match query_str(query, "value") {
+                Some("follow") => 1u8,
+                Some("standard") => 0u8,
+                Some("privacy") => 2u8,
+                _ => {
+                    respond(c, "400 Bad Request", "{\"ok\":false,\"error\":\"value must be follow|standard|privacy\"}");
+                    return;
+                }
+            };
+            log(&format!("api: /mode value={}", m));
+            if send(&[device_mode(m)]) {
+                respond(c, "200 OK", "{\"ok\":true}");
+            } else {
+                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
+            }
+        }
+        ("POST", "/home") => {
+            let (pan, tilt) = read_start_pos();
+            log("api: /home");
+            if send(&[motor_pos(1, pan), motor_pos(2, tilt)]) {
+                respond(c, "200 OK", "{\"ok\":true}");
+            } else {
+                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
+            }
+        }
+        _ => respond(c, "404 Not Found", "{\"ok\":false,\"error\":\"unknown endpoint\"}"),
+    }
+}
+
 // ---- daemon -----------------------------------------------------------------
 
 fn run_daemon() {
@@ -337,6 +524,12 @@ fn run_daemon() {
         };
         let (mut last_open, mut last_close) = scan();
         log(&format!("baseline open_ts={} close_ts={}", last_open, last_close));
+
+        let mut api: Option<ApiServer> = if read_api_enabled() {
+            start_api_server()
+        } else {
+            None
+        };
 
         loop {
             let _ = ResetEvent(event);
@@ -367,6 +560,14 @@ fn run_daemon() {
                 on_active();
             } else if closed && read_auto_privacy() {
                 on_inactive();
+            }
+
+            // apply the API-server toggle saved from the setup GUI
+            let want_api = read_api_enabled();
+            if want_api && api.is_none() {
+                api = start_api_server();
+            } else if !want_api && api.is_some() {
+                stop_api_server(api.take().unwrap());
             }
         }
         let _ = RegCloseKey(key);
