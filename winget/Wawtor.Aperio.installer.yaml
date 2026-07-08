@@ -1,5 +1,5 @@
 PackageIdentifier: Wawtor.Aperio
-PackageVersion: 0.1.0
+PackageVersion: 0.2.0
 Platform:
   - Windows.Desktop
 MinimumOSVersion: 10.0.0.0
@@ -11,7 +11,7 @@ InstallModes:
 UpgradeBehavior: install
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/wawtor/aperio/releases/download/v0.1.0/Aperio-v0.1.0-Setup.exe
-    InstallerSha256: a78b700c8f2611c68cf06af33f61a76ba400bed8a0d2bc6115ed8a09d371dc1e
+    InstallerUrl: https://github.com/wawtor/aperio/releases/download/v0.2.0/Aperio-v0.2.0-Setup.exe
+    InstallerSha256: 5ADD7ED725010A0649D8EDEFD738D8D879BAF0CDFD8C719F100ACC089E743A4F
 ManifestType: installer
 ManifestVersion: 1.6.0
