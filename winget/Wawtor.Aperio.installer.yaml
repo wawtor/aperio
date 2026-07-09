@@ -12,6 +12,6 @@ UpgradeBehavior: install
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/wawtor/aperio/releases/download/v0.2.1/Aperio-v0.2.1-Setup.exe
-    InstallerSha256: 5ADD7ED725010A0649D8EDEFD738D8D879BAF0CDFD8C719F100ACC089E743A4F
+    InstallerSha256: 64402F8CB49008B22AC865E7CB65C4C6AAC83B82D287014B0B68F2A36BD961D2
 ManifestType: installer
 ManifestVersion: 1.6.0
