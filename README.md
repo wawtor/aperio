@@ -135,11 +135,13 @@ toggle in the setup GUI (`aperio`) and save. The daemon then listens on
 
 | Endpoint | Method | Description |
 |---|---|---|
+| `/` | GET | Endpoint index (JSON) |
 | `/status` | GET | Daemon info, camera presence, saved settings (JSON) |
 | `/move?pan=X&tilt=Y` | POST | Absolute move in degrees (either param optional) |
 | `/move_rel?pan=X&tilt=Y` | POST | Relative move in degrees |
 | `/mode?value=follow\|standard\|privacy` | POST | Set device mode |
 | `/home` | POST | Return to the saved startup position |
+| `/shutdown` | POST | Turn the API server off (persists until re-enabled) |
 
 Pan is clamped to ±150°, tilt to ±90°. Examples:
 
@@ -150,8 +152,12 @@ curl -X POST "http://127.0.0.1:4750/mode?value=follow"
 curl -X POST http://127.0.0.1:4750/home
 ```
 
-Turning the toggle off closes the port. The toggle is applied when the daemon
-starts and re-checked on every camera open/close event.
+All settings toggles apply immediately — the daemon watches its config
+directory, so flipping the API server on or off (in the GUI or via
+`POST /shutdown`) takes effect within a second, no restart or camera event
+needed. Click the **?** next to the toggle in the GUI for a quick reference
+of the endpoints — handy when wiring up your own joystick, stream deck
+buttons, or OBS scripts.
 
 ---
 

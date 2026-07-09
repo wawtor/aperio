@@ -29,22 +29,25 @@ use std::{thread, fs, io::Write, path::PathBuf};
 
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, HANDLE, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE,
+    CloseHandle, BOOL, HANDLE, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegNotifyChangeKeyValue, RegOpenKeyExW, RegQueryValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_THREAD_AGNOSTIC,
     REG_VALUE_TYPE,
 };
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::{
+    CreateEventW, ResetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::HidD_GetHidGuid;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, FindFirstChangeNotificationW, FindNextChangeNotification, WriteFile,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 const WEBCAM: &str =
@@ -252,11 +255,18 @@ fn on_active() {
     let track = read_tracking();
     let mode  = if track { 1 } else { 0 };  // 1=Follow, 0=Standard
     log(&format!(
-        "camera ACTIVE -> goto {:.1}/{:.1} + mode={} ({})",
+        "camera ACTIVE -> wake + goto {:.1}/{:.1} + mode={} ({})",
         pan, tilt, mode, if track { "Follow" } else { "Standard" }
     ));
-    let frames = [motor_pos(1, pan), motor_pos(2, tilt), device_mode(mode)];
-    let ok = send(&frames);
+    // Wake to Standard first: motor commands are silently discarded while the
+    // camera is parked in Privacy, and unparking needs a moment to settle.
+    let mut ok = send(&[device_mode(0)]);
+    thread::sleep(Duration::from_millis(1200));
+    ok &= send(&[motor_pos(1, pan), motor_pos(2, tilt)]);
+    if mode != 0 {
+        thread::sleep(Duration::from_millis(400));
+        ok &= send(&[device_mode(mode)]);
+    }
     log(if ok { "  -> sent" } else { "  -> send FAILED" });
 }
 
@@ -349,11 +359,13 @@ fn scan() -> (u64, u64) {
 // Minimal HTTP/1.1 endpoint on 127.0.0.1:API_PORT so user applications can
 // drive the camera. Enabled only while api_server.state contains "1".
 //
+//   GET  /                                endpoint index (JSON)
 //   GET  /status                          daemon + config info (JSON)
 //   POST /move?pan=X&tilt=Y               absolute move (deg, either optional)
 //   POST /move_rel?pan=X&tilt=Y           relative move (deg, either optional)
 //   POST /mode?value=follow|standard|privacy
 //   POST /home                            go to the saved startup position
+//   POST /shutdown                        turn the API server off (persists)
 
 struct ApiServer {
     stop: Arc<AtomicBool>,
@@ -436,6 +448,15 @@ fn handle_client(c: &mut TcpStream) {
     };
 
     match (method, path) {
+        ("GET", "/") => {
+            respond(c, "200 OK",
+                "{\"name\":\"aperio\",\"port\":4750,\"endpoints\":[\"GET /\",\"GET /status\",\"POST /move?pan=X&tilt=Y\",\"POST /move_rel?pan=X&tilt=Y\",\"POST /mode?value=follow|standard|privacy\",\"POST /home\",\"POST /shutdown\"]}");
+        }
+        ("POST", "/shutdown") => {
+            log("api: /shutdown -> disabling api server");
+            let _ = fs::write(exe_dir().join("api_server.state"), "0\n");
+            respond(c, "200 OK", "{\"ok\":true,\"note\":\"api server disabled\"}");
+        }
         ("GET", "/status") => {
             let (pan, tilt) = read_start_pos();
             let body = format!(
@@ -522,6 +543,18 @@ fn run_daemon() {
                 return;
             }
         };
+        // watch the config dir so GUI toggles / api shutdown apply immediately
+        let dir_w = wide(&exe_dir().to_string_lossy());
+        let dir_notif = FindFirstChangeNotificationW(
+            PCWSTR(dir_w.as_ptr()),
+            BOOL(0),
+            FILE_NOTIFY_CHANGE_LAST_WRITE,
+        )
+        .ok();
+        if dir_notif.is_none() {
+            log("WARN: config-dir watch unavailable; api toggle applies on camera events only");
+        }
+
         let (mut last_open, mut last_close) = scan();
         log(&format!("baseline open_ts={} close_ts={}", last_open, last_close));
 
@@ -530,39 +563,67 @@ fn run_daemon() {
         } else {
             None
         };
+        let mut reg_armed = false;
 
         loop {
-            let _ = ResetEvent(event);
-            let r = RegNotifyChangeKeyValue(
-                key,
-                BOOL(1), // watch subtree
-                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
-                event,
-                BOOL(1), // asynchronous (signal the event)
-            );
-            if r != ERROR_SUCCESS {
-                log("FATAL: RegNotifyChangeKeyValue failed");
+            if !reg_armed {
+                let _ = ResetEvent(event);
+                let r = RegNotifyChangeKeyValue(
+                    key,
+                    BOOL(1), // watch subtree
+                    REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+                    event,
+                    BOOL(1), // asynchronous (signal the event)
+                );
+                if r != ERROR_SUCCESS {
+                    log("FATAL: RegNotifyChangeKeyValue failed");
+                    break;
+                }
+                reg_armed = true;
+            }
+
+            let fired = match dir_notif {
+                Some(dn) => {
+                    let w = WaitForMultipleObjects(&[event, dn], BOOL(0), INFINITE);
+                    w.0.wrapping_sub(WAIT_OBJECT_0.0)
+                }
+                None => {
+                    WaitForSingleObject(event, INFINITE);
+                    0
+                }
+            };
+
+            if fired == 0 {
+                // registry (camera consent store) changed
+                reg_armed = false;
+                thread::sleep(Duration::from_millis(300)); // debounce burst of writes
+
+                let (o, c) = scan();
+                let opened = o > last_open;
+                let closed = c > last_close;
+                if o > last_open {
+                    last_open = o;
+                }
+                if c > last_close {
+                    last_close = c;
+                }
+                if opened {
+                    on_active();
+                } else if closed && read_auto_privacy() {
+                    on_inactive();
+                }
+            } else if fired == 1 {
+                // config dir changed (GUI toggle or api /shutdown)
+                thread::sleep(Duration::from_millis(150)); // let the write finish
+                if let Some(dn) = dir_notif {
+                    let _ = FindNextChangeNotification(dn);
+                }
+            } else {
+                log("FATAL: wait failed");
                 break;
             }
-            WaitForSingleObject(event, INFINITE);
-            thread::sleep(Duration::from_millis(300)); // debounce burst of writes
 
-            let (o, c) = scan();
-            let opened = o > last_open;
-            let closed = c > last_close;
-            if o > last_open {
-                last_open = o;
-            }
-            if c > last_close {
-                last_close = c;
-            }
-            if opened {
-                on_active();
-            } else if closed && read_auto_privacy() {
-                on_inactive();
-            }
-
-            // apply the API-server toggle saved from the setup GUI
+            // apply the API-server toggle
             let want_api = read_api_enabled();
             if want_api && api.is_none() {
                 api = start_api_server();

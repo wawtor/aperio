@@ -298,9 +298,18 @@ class App(tk.Tk):
             ("Local API server","Control the camera from your own apps", S(354), "_api_on"),
         )
         for label, caption, y, attr in rows:
-            cv.create_text(lx, y,       anchor="w", text=label,   font=("Segoe UI", 10), fill=FG)
+            li = cv.create_text(lx, y, anchor="w", text=label, font=("Segoe UI", 10), fill=FG)
             cv.create_text(lx, y+S(18), anchor="w", text=caption, font=("Segoe UI", 8),  fill=FAINT)
             self._make_toggle(rx-S(44), y-S(2), attr)
+            if attr == "_api_on":
+                hx = cv.bbox(li)[2] + S(13)
+                cv.create_oval(hx-S(8), y-S(8), hx+S(8), y+S(8),
+                               outline=FAINT, width=1, tags="apihelp")
+                cv.create_text(hx, y, text="?", font=("Segoe UI", 8, "bold"),
+                               fill=DIM, tags="apihelp")
+                cv.tag_bind("apihelp", "<Button-1>", lambda _e: self._show_api_help())
+                cv.tag_bind("apihelp", "<Enter>", lambda _e: cv.config(cursor="hand2"))
+                cv.tag_bind("apihelp", "<Leave>", lambda _e: cv.config(cursor=""))
 
         cv.create_line(lx, S(388), rx, S(388), fill=EDGE)
         cv.create_text(lx, S(408), anchor="w", text="Startup position",
@@ -457,6 +466,19 @@ class App(tk.Tk):
     def _flip_toggle(self, attr):
         on = not getattr(self, attr)
         setattr(self, attr, on)
+        # persist immediately -- the daemon watches the config dir
+        path, label = {
+            "_track_on":   (STATEFILE,   "AI tracking"),
+            "_privacy_on": (PRIVACYFILE, "Auto privacy"),
+            "_invert_on":  (INVERTFILE,  "Invert joystick"),
+            "_api_on":     (APIFILE,     "Local API server"),
+        }[attr]
+        try:
+            with open(path, "w") as f:
+                f.write("1\n" if on else "0\n")
+            self._flash("%s %s — applied" % (label, "on" if on else "off"))
+        except Exception:
+            pass
         t = self._toggles[attr]
         cv = self._cv
         col = ACC if on else "#262e50"
@@ -586,7 +608,76 @@ class App(tk.Tk):
                      self._api_on)
         self._cv.itemconfigure(self._saved_item,
                                text="Pan %+.1f°  ·  Tilt %+.1f°" % (pan, tilt))
-        self._flash("Saved — takes effect the next time an app opens the camera")
+        self._flash("Saved — position applies the next time an app opens the camera")
+
+    # ---- API help ----
+
+    def _show_api_help(self):
+        if getattr(self, "_help_win", None) is not None:
+            try:
+                if self._help_win.winfo_exists():
+                    self._help_win.lift()
+                    return
+            except Exception:
+                pass
+        w = tk.Toplevel(self)
+        self._help_win = w
+        w.title("Aperio — Local API")
+        w.configure(bg=BG_TOP)
+        w.resizable(False, False)
+        w.transient(self)
+        try:
+            w.iconbitmap(os.path.join(HERE, "aperio.ico"))
+        except Exception:
+            pass
+        try:
+            from ctypes import windll, byref, c_int, sizeof
+            w.update_idletasks()
+            hwnd = windll.user32.GetParent(w.winfo_id())
+            windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), sizeof(c_int))
+        except Exception:
+            pass
+
+        pad = S(20)
+        f = tk.Frame(w, bg=BG_TOP, padx=pad, pady=pad)
+        f.pack(fill="both", expand=True)
+        tk.Label(f, text="Local API server", font=("Segoe UI Semibold", 12),
+                 bg=BG_TOP, fg=FG, anchor="w").pack(fill="x")
+        tk.Label(f, text="While the toggle is on, the Aperio daemon listens on\n"
+                         "http://127.0.0.1:4750  (this PC only — not reachable from the network)",
+                 font=("Segoe UI", 9), bg=BG_TOP, fg=DIM, anchor="w",
+                 justify="left").pack(fill="x", pady=(S(4), S(12)))
+
+        endpoints = (
+            ("GET  /",                        "endpoint index"),
+            ("GET  /status",                  "daemon + camera info"),
+            ("POST /move?pan=X&tilt=Y",       "absolute move (degrees)"),
+            ("POST /move_rel?pan=X&tilt=Y",   "relative move (degrees)"),
+            ("POST /mode?value=follow|standard|privacy", "set device mode"),
+            ("POST /home",                    "go to saved startup position"),
+            ("POST /shutdown",                "turn this API server off"),
+        )
+        grid = tk.Frame(f, bg=CARD, padx=S(12), pady=S(10),
+                        highlightthickness=1, highlightbackground=EDGE)
+        grid.pack(fill="x")
+        for r, (ep, desc) in enumerate(endpoints):
+            tk.Label(grid, text=ep, font=("Consolas", 9), bg=CARD, fg=ACC_HI,
+                     anchor="w").grid(row=r, column=0, sticky="w", pady=1)
+            tk.Label(grid, text=desc, font=("Segoe UI", 9), bg=CARD, fg=DIM,
+                     anchor="w").grid(row=r, column=1, sticky="w", padx=(S(16), 0))
+
+        tk.Label(f, text="Pan is clamped to ±150°, tilt to ±90°.  Example:",
+                 font=("Segoe UI", 9), bg=BG_TOP, fg=DIM, anchor="w",
+                 justify="left").pack(fill="x", pady=(S(12), S(2)))
+        tk.Label(f, text='curl -X POST "http://127.0.0.1:4750/move?pan=30&tilt=-10"',
+                 font=("Consolas", 9), bg=BG_TOP, fg=FG, anchor="w").pack(fill="x")
+        tk.Label(f, text="Toggle changes apply immediately — build your own joystick,\n"
+                         "stream deck buttons, OBS scripts, anything that can speak HTTP.",
+                 font=("Segoe UI", 9), bg=BG_TOP, fg=DIM, anchor="w",
+                 justify="left").pack(fill="x", pady=(S(10), S(12)))
+        tk.Button(f, text="  Close  ", command=w.destroy, font=("Segoe UI", 9),
+                  bg=BTN2, fg=FG, activebackground=BTN2_HOV, activeforeground=FG,
+                  relief="flat", cursor="hand2").pack(anchor="e")
 
     def _on_close(self):
         self._stop = True
