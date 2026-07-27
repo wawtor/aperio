@@ -27,6 +27,8 @@ STARTPOSFILE = os.path.join(HERE, "start_pos.txt")
 STATEFILE    = os.path.join(HERE, "last_track.state")
 PRIVACYFILE  = os.path.join(HERE, "auto_privacy.state")
 INVERTFILE   = os.path.join(HERE, "joystick_invert.state")
+FLIPFILE     = os.path.join(HERE, "image_flip.state")
+MIRRORFILE   = os.path.join(HERE, "image_mirror.state")
 APIFILE      = os.path.join(HERE, "api_server.state")
 
 # Camera HID identifiers (EMEET Pixy / Piko series)
@@ -156,11 +158,13 @@ def _load_start_pos():
     except:
         return 0.0, 0.0
 
-def _save_config(pan, tilt, tracking, auto_privacy, invert, api):
+def _save_config(pan, tilt, tracking, auto_privacy, invert, flip, mirror, api):
     with open(STARTPOSFILE, "w") as f: f.write("%.2f %.2f\n" % (pan, tilt))
     with open(STATEFILE,    "w") as f: f.write("1\n" if tracking    else "0\n")
     with open(PRIVACYFILE,  "w") as f: f.write("1\n" if auto_privacy else "0\n")
     with open(INVERTFILE,   "w") as f: f.write("1\n" if invert       else "0\n")
+    with open(FLIPFILE,     "w") as f: f.write("1\n" if flip         else "0\n")
+    with open(MIRRORFILE,   "w") as f: f.write("1\n" if mirror       else "0\n")
     with open(APIFILE,      "w") as f: f.write("1\n" if api          else "0\n")
 
 
@@ -178,12 +182,16 @@ class App(tk.Tk):
 
         self._jx = 0.0; self._jy = 0.0; self._dragging = False
         self._goto_target = None
+        self._reverse_target = False
+        self._home_target = None
         self._pan = 0.0; self._tilt = 0.0
         self._stop = False; self._hid = None
 
         self._track_on   = _load(STATEFILE,   True)
         self._privacy_on = _load(PRIVACYFILE, True)
         self._invert_on  = _load(INVERTFILE,  False)
+        self._flip_on    = _load(FLIPFILE,    False)
+        self._mirror_on  = _load(MIRRORFILE,  False)
         self._api_on     = _load(APIFILE,     False)
 
         self._toggles = {}
@@ -224,7 +232,7 @@ class App(tk.Tk):
     # ---- UI ----
 
     def _build_ui(self):
-        W, H = S(640), S(504)
+        W, H = S(640), S(592)
         self.configure(bg=BG_TOP)
         cv = tk.Canvas(self, width=W, height=H, highlightthickness=0, bd=0, bg=BG_TOP)
         cv.pack()
@@ -245,8 +253,8 @@ class App(tk.Tk):
                        font=("Segoe UI", 9), fill=DIM)
 
         # Cards
-        self._card(S(26),  S(80), S(312), S(430))
-        self._card(S(326), S(80), S(614), S(430))
+        self._card(S(26),  S(80), S(312), S(518))
+        self._card(S(326), S(80), S(614), S(518))
 
         # Left card: joystick
         self._jcx, self._jcy = S(169), S(206)
@@ -294,8 +302,10 @@ class App(tk.Tk):
         rows = (
             ("AI tracking",     "Camera follows you while in use",       S(222), "_track_on"),
             ("Auto privacy",    "Lens parks down when no app uses it",   S(266), "_privacy_on"),
-            ("Invert joystick", "Reverse drag direction",                S(310), "_invert_on"),
-            ("Local API server","Control the camera from your own apps", S(354), "_api_on"),
+            ("Flip image",      "180° for cameras mounted upside-down",  S(310), "_flip_on"),
+            ("Mirror image",    "Horizontally mirror the video",         S(354), "_mirror_on"),
+            ("Invert joystick", "Reverse drag direction",                S(398), "_invert_on"),
+            ("Local API server","Control the camera from your own apps", S(442), "_api_on"),
         )
         for label, caption, y, attr in rows:
             li = cv.create_text(lx, y, anchor="w", text=label, font=("Segoe UI", 10), fill=FG)
@@ -311,18 +321,18 @@ class App(tk.Tk):
                 cv.tag_bind("apihelp", "<Enter>", lambda _e: cv.config(cursor="hand2"))
                 cv.tag_bind("apihelp", "<Leave>", lambda _e: cv.config(cursor=""))
 
-        cv.create_line(lx, S(388), rx, S(388), fill=EDGE)
-        cv.create_text(lx, S(408), anchor="w", text="Startup position",
+        cv.create_line(lx, S(476), rx, S(476), fill=EDGE)
+        cv.create_text(lx, S(496), anchor="w", text="Startup position",
                        font=("Segoe UI", 9), fill=DIM)
-        self._saved_item = cv.create_text(rx, S(408), anchor="e",
+        self._saved_item = cv.create_text(rx, S(496), anchor="e",
                                           text="Pan %+.1f°  ·  Tilt %+.1f°" % _load_start_pos(),
                                           font=("Segoe UI", 9), fill=FG)
 
         # Footer
-        self._status_item = cv.create_text(S(30), S(469), anchor="w", text="",
+        self._status_item = cv.create_text(S(30), S(557), anchor="w", text="",
                                            font=("Segoe UI", 9), fill=GOOD)
-        self._button(S(428), S(451), S(514), S(487), "Close", False, self._on_close)
-        self._button(S(528), S(451), S(614), S(487), "Save",  True,  self._save)
+        self._button(S(428), S(539), S(514), S(575), "Close", False, self._on_close)
+        self._button(S(528), S(539), S(614), S(575), "Save",  True,  self._save)
 
         # Joystick interaction
         cv.bind("<ButtonPress-1>",   self._jdown)
@@ -471,6 +481,8 @@ class App(tk.Tk):
             "_track_on":   (STATEFILE,   "AI tracking"),
             "_privacy_on": (PRIVACYFILE, "Auto privacy"),
             "_invert_on":  (INVERTFILE,  "Invert joystick"),
+            "_flip_on":    (FLIPFILE,    "Flip image"),
+            "_mirror_on":  (MIRRORFILE,  "Mirror image"),
             "_api_on":     (APIFILE,     "Local API server"),
         }[attr]
         try:
@@ -479,6 +491,8 @@ class App(tk.Tk):
             self._flash("%s %s — applied" % (label, "on" if on else "off"))
         except Exception:
             pass
+        if attr in ("_flip_on", "_mirror_on"):
+            self._reverse_target = True
         t = self._toggles[attr]
         cv = self._cv
         col = ACC if on else "#262e50"
@@ -605,10 +619,11 @@ class App(tk.Tk):
     def _save(self):
         pan, tilt = self._pan, self._tilt
         _save_config(pan, tilt, self._track_on, self._privacy_on, self._invert_on,
-                     self._api_on)
+                     self._flip_on, self._mirror_on, self._api_on)
+        self._home_target = (pan, tilt)
         self._cv.itemconfigure(self._saved_item,
                                text="Pan %+.1f°  ·  Tilt %+.1f°" % (pan, tilt))
-        self._flash("Saved — position applies the next time an app opens the camera")
+        self._flash("Saved — the camera will now wake up aimed here")
 
     # ---- API help ----
 
@@ -654,6 +669,8 @@ class App(tk.Tk):
             ("POST /move?pan=X&tilt=Y",       "absolute move (degrees)"),
             ("POST /move_rel?pan=X&tilt=Y",   "relative move (degrees)"),
             ("POST /mode?value=follow|standard|privacy", "set device mode"),
+            ("POST /flip?value=on|off",       "flip image 180° (upside-down mount)"),
+            ("POST /mirror?value=on|off",     "mirror image horizontally"),
             ("POST /home",                    "go to saved startup position"),
             ("POST /shutdown",                "turn this API server off"),
         )
@@ -696,6 +713,10 @@ class App(tk.Tk):
         interval = 1.0 / IO_HZ
         last_query = 0.0
         try:
+            # wake to Standard so the joystick works and readouts are real even
+            # if the camera was parked in Privacy when the GUI was opened
+            _xfer(h, 0x01, 0x01, 0x00, bytes([0]), wait=0.8)
+            time.sleep(1.0)
             self._query_pos(h); last_query = time.time()
         except Exception: pass
 
@@ -707,6 +728,42 @@ class App(tk.Tk):
                     _move_abs(h, 1, goto[0]); time.sleep(0.5)
                     _move_abs(h, 2, goto[1]); time.sleep(0.5)
                     self._query_pos(h); last_query = time.time()
+                except Exception: pass
+                continue
+
+            home = self._home_target
+            if home is not None:
+                self._home_target = None
+                try:
+                    # wake to Standard first: while parked, motor moves are
+                    # discarded but the capture below is NOT -- it would store
+                    # the parked pose (tilt -90) as the wake default
+                    _xfer(h, 0x01, 0x01, 0x00, bytes([0]), wait=0.8)
+                    time.sleep(1.2)
+                    _move_abs(h, 1, home[0]); time.sleep(0.4)
+                    _move_abs(h, 2, home[1])
+                    end = time.time() + 5.0
+                    while time.time() < end:
+                        self._query_pos(h)
+                        if abs(self._pan - home[0]) < 0.8 and abs(self._tilt - home[1]) < 0.8:
+                            break
+                        time.sleep(0.3)
+                    # SET_MOTOR_POWER_ON_DEFAULT_POS_MODE(1): capture the current
+                    # position as the camera's power-on/wake default
+                    _xfer(h, 0x03, 0x01, 0x13, bytes([1]), wait=0.6)
+                    last_query = time.time()
+                except Exception: pass
+                continue
+
+            if self._reverse_target:
+                self._reverse_target = False
+                f = 1 if self._flip_on else 0
+                m = 1 if self._mirror_on else 0
+                try:
+                    # SET_REVERSE_STA: ReverseType 1 = horizontal, 2 = vertical
+                    # flip (180°) reverses both axes, mirror reverses horizontal
+                    _xfer(h, 0x04, 0x00, 0x08, bytes([1, f ^ m]), wait=0.4)
+                    _xfer(h, 0x04, 0x00, 0x08, bytes([2, f]), wait=0.4)
                 except Exception: pass
                 continue
 

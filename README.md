@@ -90,8 +90,12 @@ python aperio.py
 - Or **type coordinates** directly (Pan ±150°, Tilt ±90°)
 - Toggle **AI Tracking** — camera follows your face when in use
 - Toggle **Auto Privacy** — lens parks down when no app is using the camera
+- Toggle **Flip image** — 180° rotation for cameras mounted upside-down (hanging)
+- Toggle **Mirror image** — horizontally mirror the video
 - Toggle **Local API server** — control the camera from your own apps (off by default)
-- Click **Save**, then close
+- Click **Save**, then close — the position is also programmed into the camera
+  itself as its power-on default, so the lens rises already aimed at it when it
+  wakes (no visible correction move)
 
 ### 3. Install the daemon
 
@@ -118,8 +122,18 @@ To remove everything run `uninstall.bat`.
 The daemon watches the Windows `CapabilityAccessManager` webcam consent
 registry for changes using zero-overhead event notification (no polling).
 
-- **App opens camera** → daemon aims gimbal to saved position, enables Follow mode
-- **All apps close camera** → daemon parks lens to Privacy (if Auto Privacy is on)
+- **App opens camera** → the daemon immediately redirects the rising lens to
+  the saved position (one continuous motion — no wake-at-center-then-slew),
+  re-aims once the unpark settles, reapplies flip/mirror (the firmware reverts
+  orientation to its own stored value on every wake), and enables Follow mode.
+  Save also programs the position into the camera as its power-on default, so
+  even a plain power-on comes up aimed correctly
+- **All apps close camera** → daemon parks lens to Privacy (if Auto Privacy is on),
+  after a 5-second grace period — apps that release and reopen the camera while
+  renegotiating the stream (e.g. Windows Camera switching photo/video mode) see
+  an untouched device instead of one that is busy parking. It drops the camera
+  to Standard before parking: a camera parked in Follow wakes with the AI
+  already hunting for a subject (a fast pan sweep) before any correction can land
 
 Nothing is sent to the camera while idle — vendor HID commands reset the
 camera's privacy timer, so any keepalive would prevent it from ever sleeping.
@@ -140,6 +154,8 @@ toggle in the setup GUI (`aperio`) and save. The daemon then listens on
 | `/move?pan=X&tilt=Y` | POST | Absolute move in degrees (either param optional) |
 | `/move_rel?pan=X&tilt=Y` | POST | Relative move in degrees |
 | `/mode?value=follow\|standard\|privacy` | POST | Set device mode |
+| `/flip?value=on\|off` | POST | Flip the image 180° (upside-down mounting) |
+| `/mirror?value=on\|off` | POST | Mirror the image horizontally |
 | `/home` | POST | Return to the saved startup position |
 | `/shutdown` | POST | Turn the API server off (persists until re-enabled) |
 
@@ -180,6 +196,8 @@ Config files are created by `aperio.py` on first save and live alongside the exe
 | `last_track.state` | AI tracking on/off (1/0) |
 | `auto_privacy.state` | Auto privacy on/off (1/0) |
 | `joystick_invert.state` | Invert joystick on/off (1/0) |
+| `image_flip.state` | Image flip 180° on/off (1/0; absent = never touch flip) |
+| `image_mirror.state` | Horizontal mirror on/off (1/0; absent = never touch mirror) |
 | `api_server.state` | Local API server on/off (1/0, default off) |
 
 ---

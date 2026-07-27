@@ -288,8 +288,41 @@ only in `b3`. ⚠️ = do not send (firmware / destructive).
 | `GET_MOTOR_POWER_ON_DEFAULT_POS_MODE` | `09 03 01 14` |
 | `SET_MOTOR_PRESET_POS_MODE` | `09 03 01 15` |
 | `GET_MOTOR_PRESET_POS_MODE` | `09 03 01 16` |
-| `SET_MOTOR_DEFAULT_POS` (set "home") | `09 03 01 17` |
+| `SET_MOTOR_DEFAULT_POS` (goto stored home) | `09 03 01 17` |
 | `SET_MOTOR_PRESET_POS` (save/goto preset) | `09 03 01 18` |
+
+**✔ Power-on default position — decoded live (2026-07-18):**
+
+- `SET_MOTOR_POWER_ON_DEFAULT_POS_MODE` (`09 03 01 13`, payload `[mode:u8]`) —
+  **mode `1` captures the camera's CURRENT position as its power-on/wake
+  default and enables it.** The store happens at mode-set time: aim first,
+  then send. Mode `0` disables it (device then homes to pan 0°/tilt 0° on
+  wake — the factory behavior). Values 2/3 ack `0x20` but do not latch.
+- `GET_MOTOR_POWER_ON_DEFAULT_POS_MODE` (`09 03 01 14`, no payload) → 13 bytes
+  `[mode:u8][pan:f32][tilt:f32][axis3:f32]` — the stored default (all zeros if
+  never set).
+- `SET_MOTOR_DEFAULT_POS` (`09 03 01 17`, no payload) acks `0x20` but does
+  **not** store anything — per the STUDIO symbols (`setToDefaultPos`) it is
+  "go **to** the stored default". The earlier "set home" label was wrong.
+- `GET_MOTOR_PRESET_POS_MODE` (`09 03 01 16`, payload `[index:u8]`) → 14 bytes
+  `[index:u8][mode:u8][pan:f32][tilt:f32][f32]` (echoes the index).
+- With mode 1 set, **an explicit HID wake (`SET_DEVICE_MODE(0)`) raises the
+  lens directly at the stored default — no host command involved.** Verified:
+  parked at pan +25°, woke straight to the stored (−8.17, +12.34). The stored
+  value is NOT refreshed by moves, parking, or waking — only by an explicit
+  mode-1 capture. Aperio re-captures it on every GUI Save.
+- **⚠ The stream-open SELF-wake does NOT honor the stored default** (traced
+  live): when an app opens the video stream, the camera un-parks toward
+  factory pan 0°/tilt 0° regardless. The stored default applies to HID wakes
+  and power-on only. Mitigation: send `SET_MOTOR_POS` immediately when the
+  open event fires — a mid-rise target rewrite redirects the lens to the
+  wanted position in one continuous motion (the Aperio daemon does this, plus
+  a second aim after unpark settles as the guaranteed correction).
+- **⚠ A camera parked while in Follow wakes with the AI already hunting**
+  (fast ~80°/s pan sweep to wherever it thinks a subject is) before any host
+  command lands. Park from Standard (`SET_DEVICE_MODE(0)` then `(2)`) to get
+  a still wake; re-enable Follow after aiming.
+- Privacy park keeps the pan angle and only drops tilt to −90°.
 
 **AI tracking / framing / focus / exposure region (group 0x04)**
 
@@ -394,10 +427,33 @@ EMEET STUDIO that drives privacy via the device‑mode/PTZ logic.)*
   reads (read‑only) decode the payloads as:
   - `GET_TARGET_TRACK` → `[TrackMode:1][f32][f32][f32]` (LEN 13). `TrackMode 0` = off.
   - `GET_DEVICE_MODE` → `[DeviceMode:1]` (LEN 1). Observed current value **`2`**
-    (= the standard framing mode).
+    (= the standard framing mode). **⚠ The GET readback enum does not match the
+    SET enum** (SET uses 0=Standard, 1=Follow, 2=Privacy — proven by the daemon):
+    live, GET returned `2` while streaming un-parked, and `SET 0` acked `0x40`
+    (not `0x20`) with a transient readback of `3` settling back to `2`. Treat the
+    GET value as opaque.
+  - **⚠ Whiteboard-mode wedge (2026-07-10):** switching the Windows Camera app
+    to its whiteboard option and back left the camera's UVC video function dead:
+    descriptors degraded to a single 2560x1440 (yuyv/nv12) format, zero frames
+    delivered, Windows Camera failing with `0xA00F4271 (0xC00D36D5 MF_E_NOT_FOUND)`.
+    Vendor HID (motors/flip) kept working throughout. **Recovery:**
+    `pnputil /restart-device "USB\VID_328F&PID_00C0\<serial>"` re-enumerates and
+    restores frame delivery (full power-cycle not required). Note the HID MCU and
+    the ISP can desync while wedged: `GET_REVERSE_STA` reported the flip state of
+    commands that were never applied to the image pipeline.
   - `GET_GESTURE_RECOG_STA` → `[GestureType:1][enabled:1]` (LEN 2). Observed
     `GestureType=0, enabled=1` (gesture recognition was on).
   - `GET_REVERSE_STA` → `[ReverseType:1][on:1]`. Observed `0,0` (no flip).
+    **✔ `ReverseType` confirmed live (set/readback):** `1` = horizontal flip,
+    `2` = vertical flip — both latch and read back correctly. `0` acks (`0x20`)
+    but never latches (likely "auto-flip", unsupported on the Pixy). The GET
+    requires the type byte in its payload and echoes it back. 180° rotation for
+    upside-down mounting = both `1` and `2` on; mirror = `1` only (combined
+    with flip: H = flip XOR mirror, V = flip).
+    **⚠ The firmware reverts to its own persisted reverse state on every wake**
+    (verified 2026-07-18: set H=0 while awake, survived the park, but the wake
+    restored H=1) — host SETs do not update the persisted copy, so the desired
+    orientation must be re-sent after each wake. The Aperio daemon does this.
   - `GET_PRIVACY_TRIGGER_TIME` → `u32 LE` **seconds**. Observed `0x00000384` = **900 s
     (15 min)** auto‑privacy timeout.
   Enumerate the rest by reading the `GET_*` reply for the current UI state and
@@ -651,8 +707,9 @@ every value we saw: `3`=Standby (idle), `2`=Privacy, `0`=Standard (also what a m
    nothing to detect, so the gimbal sits still. In good light it tracks immediately. The
    blocker was never the protocol — it was whether the camera could *see* a subject.
 5. **Wake resets `DeviceMode → Standard(0)`** and re‑homes the gimbal to the motor
-   power‑on default (**−16° tilt**, via `SET_MOTOR_POWER_ON_DEFAULT_POS_MODE 09 03 01 13`
-   / `SET_MOTOR_DEFAULT_POS 09 03 01 17`). So to keep tracking persistent, re‑send
+   power‑on default — **pan 0°/tilt 0° from factory** (not −16° as earlier assumed),
+   or the stored custom default once `SET_MOTOR_POWER_ON_DEFAULT_POS_MODE(1)` has
+   captured one (see §4.3). So to keep tracking persistent, re‑send
    `SET_DEVICE_MODE(Follow)` **after** each wake / stream start — this is exactly what
    `pixy_autotrack.py` now does.
 6. `GET_MOTOR_POS` returns a **cached/target** value while the AI is driving the motors,

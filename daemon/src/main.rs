@@ -30,6 +30,7 @@ use std::{thread, fs, io::Write, path::PathBuf};
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT, WAIT_FAILED,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegNotifyChangeKeyValue, RegOpenKeyExW, RegQueryValueExW,
@@ -59,6 +60,12 @@ const DEF_TILT: f32 = -15.9;
 
 // Local API server (opt-in via api_server.state, loopback only).
 const API_PORT: u16 = 4750;
+
+// Grace period before parking to Privacy after the last app releases the camera.
+// Apps renegotiating the stream (e.g. Windows Camera switching photo/video mode)
+// release and reopen within a second or two; parking immediately makes the
+// reopen land on a mid-park camera that discards commands and fails the stream.
+const PARK_DELAY: Duration = Duration::from_secs(5);
 
 // ---- small helpers ----------------------------------------------------------
 
@@ -126,6 +133,22 @@ fn read_auto_privacy() -> bool {
     true
 }
 
+/// Read image_flip.state: Some(true) = image flipped 180° (upside-down mount),
+/// Some(false) = normal. None if the file is missing -> never touch the flip state.
+fn read_flip() -> Option<bool> {
+    fs::read_to_string(exe_dir().join("image_flip.state"))
+        .ok()
+        .map(|s| s.trim() == "1")
+}
+
+/// Read image_mirror.state: Some(true) = horizontal mirror on. None if the file
+/// is missing -> never touch the reverse state on mirror's account.
+fn read_mirror() -> Option<bool> {
+    fs::read_to_string(exe_dir().join("image_mirror.state"))
+        .ok()
+        .map(|s| s.trim() == "1")
+}
+
 /// Read api_server.state: "1" = run the local API server. Defaults to false (off).
 fn read_api_enabled() -> bool {
     if let Ok(s) = fs::read_to_string(exe_dir().join("api_server.state")) {
@@ -164,6 +187,10 @@ fn motor_rel(axis: u8, deg: f32) -> [u8; 32] {
 
 fn device_mode(m: u8) -> [u8; 32] {
     frame(0x01, 0x01, 0x00, &[m]) // SET_DEVICE_MODE (1=Follow, 2=Privacy, 0=Standard)
+}
+
+fn reverse_sta(rtype: u8, on: bool) -> [u8; 32] {
+    frame(0x04, 0x00, 0x08, &[rtype, on as u8]) // SET_REVERSE_STA (1=horizontal, 2=vertical)
 }
 
 /// Find the Pixy vendor HID interface path (VID 328F / PID 00C0 / MI_04), any USB port.
@@ -258,11 +285,25 @@ fn on_active() {
         "camera ACTIVE -> wake + goto {:.1}/{:.1} + mode={} ({})",
         pan, tilt, mode, if track { "Follow" } else { "Standard" }
     ));
-    // Wake to Standard first: motor commands are silently discarded while the
-    // camera is parked in Privacy, and unparking needs a moment to settle.
-    let mut ok = send(&[device_mode(0)]);
+    // The stream-open self-wake raises the lens toward factory 0/0 -- the
+    // stored power-on default is honored only for HID wakes and power-on.
+    // Aim immediately to redirect the rise mid-wake, then aim again once the
+    // unpark has settled: the first send can still land inside the parked
+    // window where motor commands are silently discarded.
+    let mut ok = send(&[device_mode(0), motor_pos(1, pan), motor_pos(2, tilt)]);
     thread::sleep(Duration::from_millis(1200));
     ok &= send(&[motor_pos(1, pan), motor_pos(2, tilt)]);
+    // Reapply image orientation each wake: toggles made while the camera was
+    // parked in Privacy are discarded by the device, so the saved state is
+    // authoritative. Flip (180°) reverses both axes, mirror reverses horizontal.
+    let flip = read_flip();
+    let mirror = read_mirror();
+    if flip.is_some() || mirror.is_some() {
+        let f = flip.unwrap_or(false);
+        let m = mirror.unwrap_or(false);
+        thread::sleep(Duration::from_millis(400));
+        ok &= send(&[reverse_sta(1, f != m), reverse_sta(2, f)]);
+    }
     if mode != 0 {
         thread::sleep(Duration::from_millis(400));
         ok &= send(&[device_mode(mode)]);
@@ -271,8 +312,11 @@ fn on_active() {
 }
 
 fn on_inactive() {
-    log("camera INACTIVE -> Privacy (park/sleep)");
-    let ok = send(&[device_mode(2)]);
+    log("camera INACTIVE -> Standard, then Privacy (park/sleep)");
+    // Drop to Standard before parking: a camera parked while in Follow wakes
+    // with the AI already hunting for a subject (fast pan sweep) before the
+    // daemon can re-aim it. Parked from Standard it wakes still.
+    let ok = send(&[device_mode(0), device_mode(2)]);
     log(if ok { "  -> sent (privacy)" } else { "  -> send FAILED" });
 }
 
@@ -364,6 +408,8 @@ fn scan() -> (u64, u64) {
 //   POST /move?pan=X&tilt=Y               absolute move (deg, either optional)
 //   POST /move_rel?pan=X&tilt=Y           relative move (deg, either optional)
 //   POST /mode?value=follow|standard|privacy
+//   POST /flip?value=on|off               image flip 180° (upside-down mount)
+//   POST /mirror?value=on|off             horizontal mirror
 //   POST /home                            go to the saved startup position
 //   POST /shutdown                        turn the API server off (persists)
 
@@ -450,7 +496,7 @@ fn handle_client(c: &mut TcpStream) {
     match (method, path) {
         ("GET", "/") => {
             respond(c, "200 OK",
-                "{\"name\":\"aperio\",\"port\":4750,\"endpoints\":[\"GET /\",\"GET /status\",\"POST /move?pan=X&tilt=Y\",\"POST /move_rel?pan=X&tilt=Y\",\"POST /mode?value=follow|standard|privacy\",\"POST /home\",\"POST /shutdown\"]}");
+                "{\"name\":\"aperio\",\"port\":4750,\"endpoints\":[\"GET /\",\"GET /status\",\"POST /move?pan=X&tilt=Y\",\"POST /move_rel?pan=X&tilt=Y\",\"POST /mode?value=follow|standard|privacy\",\"POST /flip?value=on|off\",\"POST /mirror?value=on|off\",\"POST /home\",\"POST /shutdown\"]}");
         }
         ("POST", "/shutdown") => {
             log("api: /shutdown -> disabling api server");
@@ -459,11 +505,18 @@ fn handle_client(c: &mut TcpStream) {
         }
         ("GET", "/status") => {
             let (pan, tilt) = read_start_pos();
+            let opt = |v: Option<bool>| match v {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "null",
+            };
             let body = format!(
-                "{{\"name\":\"aperio\",\"camera_found\":{},\"tracking\":{},\"auto_privacy\":{},\"start_pos\":{{\"pan\":{:.2},\"tilt\":{:.2}}}}}",
+                "{{\"name\":\"aperio\",\"camera_found\":{},\"tracking\":{},\"auto_privacy\":{},\"flip\":{},\"mirror\":{},\"start_pos\":{{\"pan\":{:.2},\"tilt\":{:.2}}}}}",
                 find_pixy().is_some(),
                 read_tracking(),
                 read_auto_privacy(),
+                opt(read_flip()),
+                opt(read_mirror()),
                 pan,
                 tilt
             );
@@ -505,6 +558,26 @@ fn handle_client(c: &mut TcpStream) {
             };
             log(&format!("api: /mode value={}", m));
             if send(&[device_mode(m)]) {
+                respond(c, "200 OK", "{\"ok\":true}");
+            } else {
+                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
+            }
+        }
+        ("POST", "/flip") | ("POST", "/mirror") => {
+            let on = match query_str(query, "value") {
+                Some("on") | Some("1") | Some("true") => true,
+                Some("off") | Some("0") | Some("false") => false,
+                _ => {
+                    respond(c, "400 Bad Request", "{\"ok\":false,\"error\":\"value must be on|off\"}");
+                    return;
+                }
+            };
+            log(&format!("api: {} value={}", path, on));
+            let state = if path == "/flip" { "image_flip.state" } else { "image_mirror.state" };
+            let _ = fs::write(exe_dir().join(state), if on { "1\n" } else { "0\n" });
+            let f = read_flip().unwrap_or(false);
+            let m = read_mirror().unwrap_or(false);
+            if send(&[reverse_sta(1, f != m), reverse_sta(2, f)]) {
                 respond(c, "200 OK", "{\"ok\":true}");
             } else {
                 respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
@@ -564,6 +637,9 @@ fn run_daemon() {
             None
         };
         let mut reg_armed = false;
+        // Pending Privacy park: set when all apps release the camera, executed
+        // PARK_DELAY later unless an app reopens the camera in the meantime.
+        let mut park_at: Option<std::time::Instant> = None;
 
         loop {
             if !reg_armed {
@@ -582,18 +658,32 @@ fn run_daemon() {
                 reg_armed = true;
             }
 
-            let fired = match dir_notif {
-                Some(dn) => {
-                    let w = WaitForMultipleObjects(&[event, dn], BOOL(0), INFINITE);
-                    w.0.wrapping_sub(WAIT_OBJECT_0.0)
-                }
-                None => {
-                    WaitForSingleObject(event, INFINITE);
-                    0
-                }
+            let timeout_ms = match park_at {
+                Some(t) => t
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u32,
+                None => INFINITE,
+            };
+            let w = match dir_notif {
+                Some(dn) => WaitForMultipleObjects(&[event, dn], BOOL(0), timeout_ms),
+                None => WaitForSingleObject(event, timeout_ms),
+            };
+            let fired = if w == WAIT_TIMEOUT {
+                u32::MAX // park grace period elapsed
+            } else if w == WAIT_FAILED {
+                log("FATAL: wait failed");
+                break;
+            } else {
+                w.0.wrapping_sub(WAIT_OBJECT_0.0)
             };
 
-            if fired == 0 {
+            if fired == u32::MAX {
+                // no reopen within the grace period -> park now
+                park_at = None;
+                if read_auto_privacy() {
+                    on_inactive();
+                }
+            } else if fired == 0 {
                 // registry (camera consent store) changed
                 reg_armed = false;
                 thread::sleep(Duration::from_millis(300)); // debounce burst of writes
@@ -608,9 +698,20 @@ fn run_daemon() {
                     last_close = c;
                 }
                 if opened {
-                    on_active();
+                    if park_at.take().is_some() {
+                        // reopen within the grace period: the camera was never
+                        // parked and is still aimed -- stay silent so the app's
+                        // stream renegotiation sees an untouched device.
+                        log("camera reopened within park grace period -> no action");
+                    } else {
+                        on_active();
+                    }
                 } else if closed && read_auto_privacy() {
-                    on_inactive();
+                    log(&format!(
+                        "camera released -> parking in {}s unless reopened",
+                        PARK_DELAY.as_secs()
+                    ));
+                    park_at = Some(std::time::Instant::now() + PARK_DELAY);
                 }
             } else if fired == 1 {
                 // config dir changed (GUI toggle or api /shutdown)
