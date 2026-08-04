@@ -24,17 +24,25 @@ except ImportError:
 
 HERE         = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 STARTPOSFILE = os.path.join(HERE, "start_pos.txt")
-STATEFILE    = os.path.join(HERE, "last_track.state")
-PRIVACYFILE  = os.path.join(HERE, "auto_privacy.state")
-INVERTFILE   = os.path.join(HERE, "joystick_invert.state")
-FLIPFILE     = os.path.join(HERE, "image_flip.state")
-MIRRORFILE   = os.path.join(HERE, "image_mirror.state")
-APIFILE      = os.path.join(HERE, "api_server.state")
+
+# attr -> (state file, label, default). Single source for loading, saving and
+# the settings rows; the daemon reads the same files.
+TOGGLES = {
+    "_track_on":   ("last_track.state",      "AI tracking",      True),
+    "_privacy_on": ("auto_privacy.state",    "Auto privacy",     True),
+    "_flip_on":    ("image_flip.state",      "Flip image",       False),
+    "_mirror_on":  ("image_mirror.state",    "Mirror image",     False),
+    "_invert_on":  ("joystick_invert.state", "Invert joystick",  False),
+    "_api_on":     ("api_server.state",      "Local API server", False),
+}
 
 # Camera HID identifiers (EMEET Pixy / Piko series)
 CAM_VID = 0x328F
 CAM_PID = 0x00C0
 CAM_RID = 0x09   # vendor report ID
+
+# Local API server port (must match API_PORT in the daemon)
+API_PORT = 4750
 
 # Camera movement
 IO_HZ   = 12
@@ -77,6 +85,7 @@ FAINT    = "#575e86"
 GOOD     = "#5fd39a"
 BTN2     = "#242c4e"
 BTN2_HOV = "#2e3763"
+TGL_OFF  = "#262e50"
 
 def _hx(c):
     return (int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16))
@@ -89,6 +98,24 @@ def _rr(c, x1, y1, x2, y2, r, **kw):
     pts = (x1+r,y1, x2-r,y1, x2,y1, x2,y1+r, x2,y2-r, x2,y2,
            x2-r,y2, x1+r,y2, x1,y2, x1,y2-r, x1,y1+r, x1,y1)
     return c.create_polygon(pts, smooth=True, **kw)
+
+
+# ---- window chrome ----
+
+def _set_icon(win):
+    try:
+        win.iconbitmap(os.path.join(HERE, "aperio.ico"))
+    except Exception:
+        pass
+
+def _dark_titlebar(win):
+    try:
+        from ctypes import windll, byref, c_int, sizeof
+        win.update_idletasks()
+        hwnd = windll.user32.GetParent(win.winfo_id())
+        windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), sizeof(c_int))
+    except Exception:
+        pass
 
 
 # ---- HID communication (self-contained, no external module needed) ----
@@ -127,45 +154,55 @@ def _drain(h, win):
         if d: out.append(bytes(d))
     return out
 
+def _frame(b1, b2, b3, payload=b""):
+    return (bytes([CAM_RID, b1, b2, b3, 0x00, len(payload), 0x00, len(payload)])
+            + payload).ljust(32, b"\x00")
+
 def _xfer(h, b1, b2, b3, payload=b"", wait=0.6):
     _drain(h, 0.03)
-    frame = (bytes([CAM_RID, b1, b2, b3, 0x00, len(payload), 0x00, len(payload)]) + payload).ljust(32, b"\x00")
-    h.write(frame)
+    h.write(_frame(b1, b2, b3, payload))
     for d in _drain(h, wait):
         if len(d) >= 8 and d[1] == b1 and d[2] == b2 and d[3] == b3:
             return d[8:8 + d[5]], d
     return None, None
 
+def _move(h, axis, deg, index):
+    h.write(_frame(0x63, 0x01, index, bytes([axis]) + struct.pack("<f", float(deg))))
+
 def _move_rel(h, axis, deg):
-    pl = bytes([axis]) + struct.pack("<f", float(deg))
-    h.write((bytes([CAM_RID, 0x63, 0x01, 0x19, 0x00, len(pl), 0x00, len(pl)]) + pl).ljust(32, b"\x00"))
+    _move(h, axis, deg, 0x19)   # MOVE_MOTOR_REL
 
 def _move_abs(h, axis, deg):
-    pl = bytes([axis]) + struct.pack("<f", float(deg))
-    h.write((bytes([CAM_RID, 0x63, 0x01, 0x00, 0x00, len(pl), 0x00, len(pl)]) + pl).ljust(32, b"\x00"))
+    _move(h, axis, deg, 0x00)   # SET_MOTOR_POS
 
 
 # ---- config helpers ----
 
-def _load(path, default):
-    try: return bool(int(open(path).read().strip()))
-    except: return default
+def _state_path(attr):
+    return os.path.join(HERE, TOGGLES[attr][0])
+
+def _load_toggle(attr):
+    try:
+        return bool(int(open(_state_path(attr)).read().strip()))
+    except Exception:
+        return TOGGLES[attr][2]
+
+def _write_toggle(attr, on):
+    with open(_state_path(attr), "w") as f:
+        f.write("1\n" if on else "0\n")
 
 def _load_start_pos():
     try:
         p = open(STARTPOSFILE).read().split()
         return float(p[0]), float(p[1])
-    except:
+    except Exception:
         return 0.0, 0.0
 
-def _save_config(pan, tilt, tracking, auto_privacy, invert, flip, mirror, api):
-    with open(STARTPOSFILE, "w") as f: f.write("%.2f %.2f\n" % (pan, tilt))
-    with open(STATEFILE,    "w") as f: f.write("1\n" if tracking    else "0\n")
-    with open(PRIVACYFILE,  "w") as f: f.write("1\n" if auto_privacy else "0\n")
-    with open(INVERTFILE,   "w") as f: f.write("1\n" if invert       else "0\n")
-    with open(FLIPFILE,     "w") as f: f.write("1\n" if flip         else "0\n")
-    with open(MIRRORFILE,   "w") as f: f.write("1\n" if mirror       else "0\n")
-    with open(APIFILE,      "w") as f: f.write("1\n" if api          else "0\n")
+def _save_config(pan, tilt, values):
+    with open(STARTPOSFILE, "w") as f:
+        f.write("%.2f %.2f\n" % (pan, tilt))
+    for attr, on in values.items():
+        _write_toggle(attr, on)
 
 
 # ---- GUI ----
@@ -175,10 +212,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Aperio")
         self.resizable(False, False)
-        try:
-            self.iconbitmap(os.path.join(HERE, "aperio.ico"))
-        except Exception:
-            pass
+        _set_icon(self)
 
         self._jx = 0.0; self._jy = 0.0; self._dragging = False
         self._goto_target = None
@@ -187,12 +221,8 @@ class App(tk.Tk):
         self._pan = 0.0; self._tilt = 0.0
         self._stop = False; self._hid = None
 
-        self._track_on   = _load(STATEFILE,   True)
-        self._privacy_on = _load(PRIVACYFILE, True)
-        self._invert_on  = _load(INVERTFILE,  False)
-        self._flip_on    = _load(FLIPFILE,    False)
-        self._mirror_on  = _load(MIRRORFILE,  False)
-        self._api_on     = _load(APIFILE,     False)
+        for attr in TOGGLES:
+            setattr(self, attr, _load_toggle(attr))
 
         self._toggles = {}
         self._anim_seq = 0
@@ -221,13 +251,7 @@ class App(tk.Tk):
             self.attributes("-alpha", 0.97)
         except Exception:
             pass
-        try:
-            from ctypes import windll, byref, c_int, sizeof
-            self.update_idletasks()
-            hwnd = windll.user32.GetParent(self.winfo_id())
-            windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), sizeof(c_int))
-        except Exception:
-            pass
+        _dark_titlebar(self)
 
     # ---- UI ----
 
@@ -239,8 +263,23 @@ class App(tk.Tk):
         self._cv = cv
 
         self._paint_backdrop(W, H)
+        self._build_header()
 
-        # Header: aperture mark + title
+        # Cards
+        self._card(S(26),  S(80), S(312), S(518))
+        self._card(S(326), S(80), S(614), S(518))
+
+        self._build_joystick_card()
+        self._build_settings_card()
+        self._build_footer()
+
+        # Joystick interaction
+        cv.bind("<ButtonPress-1>",   self._jdown)
+        cv.bind("<B1-Motion>",       self._jmove)
+        cv.bind("<ButtonRelease-1>", self._jup)
+
+    def _build_header(self):
+        cv = self._cv
         mx, my = S(42), S(40)
         cv.create_oval(mx-S(11), my-S(11), mx+S(11), my+S(11), outline=ACC, width=S(2))
         for a in (25, 145, 265):
@@ -252,11 +291,8 @@ class App(tk.Tk):
                        text="Aim the camera at its startup position, then save.",
                        font=("Segoe UI", 9), fill=DIM)
 
-        # Cards
-        self._card(S(26),  S(80), S(312), S(518))
-        self._card(S(326), S(80), S(614), S(518))
-
-        # Left card: joystick
+    def _build_joystick_card(self):
+        cv = self._cv
         self._jcx, self._jcy = S(169), S(206)
         self._jr   = S(88)
         self._jpk  = S(23)
@@ -284,7 +320,8 @@ class App(tk.Tk):
         cv.create_text(self._jcx, S(384), text="±150° pan   ·   ±90° tilt",
                        font=("Segoe UI", 8), fill=FAINT)
 
-        # Right card
+    def _build_settings_card(self):
+        cv = self._cv
         lx, rx = S(344), S(596)
         cv.create_text(lx, S(102), anchor="w", text="L I V E   P O S I T I O N",
                        font=("Segoe UI", 8, "bold"), fill=FAINT)
@@ -300,15 +337,16 @@ class App(tk.Tk):
                        font=("Segoe UI", 8, "bold"), fill=FAINT)
 
         rows = (
-            ("AI tracking",     "Camera follows you while in use",       S(222), "_track_on"),
-            ("Auto privacy",    "Lens parks down when no app uses it",   S(266), "_privacy_on"),
-            ("Flip image",      "180° for cameras mounted upside-down",  S(310), "_flip_on"),
-            ("Mirror image",    "Horizontally mirror the video",         S(354), "_mirror_on"),
-            ("Invert joystick", "Reverse drag direction",                S(398), "_invert_on"),
-            ("Local API server","Control the camera from your own apps", S(442), "_api_on"),
+            ("_track_on",   "Camera follows you while in use",       S(222)),
+            ("_privacy_on", "Lens parks down when no app uses it",   S(266)),
+            ("_flip_on",    "180° for cameras mounted upside-down",  S(310)),
+            ("_mirror_on",  "Horizontally mirror the video",         S(354)),
+            ("_invert_on",  "Reverse drag direction",                S(398)),
+            ("_api_on",     "Control the camera from your own apps", S(442)),
         )
-        for label, caption, y, attr in rows:
-            li = cv.create_text(lx, y, anchor="w", text=label, font=("Segoe UI", 10), fill=FG)
+        for attr, caption, y in rows:
+            li = cv.create_text(lx, y, anchor="w", text=TOGGLES[attr][1],
+                                font=("Segoe UI", 10), fill=FG)
             cv.create_text(lx, y+S(18), anchor="w", text=caption, font=("Segoe UI", 8),  fill=FAINT)
             self._make_toggle(rx-S(44), y-S(2), attr)
             if attr == "_api_on":
@@ -328,16 +366,12 @@ class App(tk.Tk):
                                           text="Pan %+.1f°  ·  Tilt %+.1f°" % _load_start_pos(),
                                           font=("Segoe UI", 9), fill=FG)
 
-        # Footer
+    def _build_footer(self):
+        cv = self._cv
         self._status_item = cv.create_text(S(30), S(557), anchor="w", text="",
                                            font=("Segoe UI", 9), fill=GOOD)
         self._button(S(428), S(539), S(514), S(575), "Close", False, self._on_close)
         self._button(S(528), S(539), S(614), S(575), "Save",  True,  self._save)
-
-        # Joystick interaction
-        cv.bind("<ButtonPress-1>",   self._jdown)
-        cv.bind("<B1-Motion>",       self._jmove)
-        cv.bind("<ButtonRelease-1>", self._jup)
 
     # ---- painting ----
 
@@ -457,7 +491,7 @@ class App(tk.Tk):
         w, h = S(44), S(22)
         tag = "tgl_" + attr
         on = getattr(self, attr)
-        col = ACC if on else "#262e50"
+        col = ACC if on else TGL_OFF
         items = [
             cv.create_oval(x, y, x + h, y + h, fill=col, width=0, tags=tag),
             cv.create_oval(x + w - h, y, x + w, y + h, fill=col, width=0, tags=tag),
@@ -477,25 +511,16 @@ class App(tk.Tk):
         on = not getattr(self, attr)
         setattr(self, attr, on)
         # persist immediately -- the daemon watches the config dir
-        path, label = {
-            "_track_on":   (STATEFILE,   "AI tracking"),
-            "_privacy_on": (PRIVACYFILE, "Auto privacy"),
-            "_invert_on":  (INVERTFILE,  "Invert joystick"),
-            "_flip_on":    (FLIPFILE,    "Flip image"),
-            "_mirror_on":  (MIRRORFILE,  "Mirror image"),
-            "_api_on":     (APIFILE,     "Local API server"),
-        }[attr]
         try:
-            with open(path, "w") as f:
-                f.write("1\n" if on else "0\n")
-            self._flash("%s %s — applied" % (label, "on" if on else "off"))
+            _write_toggle(attr, on)
+            self._flash("%s %s — applied" % (TOGGLES[attr][1], "on" if on else "off"))
         except Exception:
             pass
         if attr in ("_flip_on", "_mirror_on"):
             self._reverse_target = True
         t = self._toggles[attr]
         cv = self._cv
-        col = ACC if on else "#262e50"
+        col = ACC if on else TGL_OFF
         for it in t["items"]:
             cv.itemconfigure(it, fill=col)
         x0 = t["x"] + t["h"] // 2
@@ -618,8 +643,7 @@ class App(tk.Tk):
 
     def _save(self):
         pan, tilt = self._pan, self._tilt
-        _save_config(pan, tilt, self._track_on, self._privacy_on, self._invert_on,
-                     self._flip_on, self._mirror_on, self._api_on)
+        _save_config(pan, tilt, {attr: getattr(self, attr) for attr in TOGGLES})
         self._home_target = (pan, tilt)
         self._cv.itemconfigure(self._saved_item,
                                text="Pan %+.1f°  ·  Tilt %+.1f°" % (pan, tilt))
@@ -641,17 +665,8 @@ class App(tk.Tk):
         w.configure(bg=BG_TOP)
         w.resizable(False, False)
         w.transient(self)
-        try:
-            w.iconbitmap(os.path.join(HERE, "aperio.ico"))
-        except Exception:
-            pass
-        try:
-            from ctypes import windll, byref, c_int, sizeof
-            w.update_idletasks()
-            hwnd = windll.user32.GetParent(w.winfo_id())
-            windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), sizeof(c_int))
-        except Exception:
-            pass
+        _set_icon(w)
+        _dark_titlebar(w)
 
         pad = S(20)
         f = tk.Frame(w, bg=BG_TOP, padx=pad, pady=pad)
@@ -659,7 +674,8 @@ class App(tk.Tk):
         tk.Label(f, text="Local API server", font=("Segoe UI Semibold", 12),
                  bg=BG_TOP, fg=FG, anchor="w").pack(fill="x")
         tk.Label(f, text="While the toggle is on, the Aperio daemon listens on\n"
-                         "http://127.0.0.1:4750  (this PC only — not reachable from the network)",
+                         "http://127.0.0.1:%d  (this PC only — not reachable from the network)"
+                         % API_PORT,
                  font=("Segoe UI", 9), bg=BG_TOP, fg=DIM, anchor="w",
                  justify="left").pack(fill="x", pady=(S(4), S(12)))
 
@@ -686,7 +702,7 @@ class App(tk.Tk):
         tk.Label(f, text="Pan is clamped to ±150°, tilt to ±90°.  Example:",
                  font=("Segoe UI", 9), bg=BG_TOP, fg=DIM, anchor="w",
                  justify="left").pack(fill="x", pady=(S(12), S(2)))
-        tk.Label(f, text='curl -X POST "http://127.0.0.1:4750/move?pan=30&tilt=-10"',
+        tk.Label(f, text='curl -X POST "http://127.0.0.1:%d/move?pan=30&tilt=-10"' % API_PORT,
                  font=("Consolas", 9), bg=BG_TOP, fg=FG, anchor="w").pack(fill="x")
         tk.Label(f, text="Toggle changes apply immediately — build your own joystick,\n"
                          "stream deck buttons, OBS scripts, anything that can speak HTTP.",

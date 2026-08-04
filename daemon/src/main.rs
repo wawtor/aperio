@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{thread, fs, io::Write, path::PathBuf};
 
-use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, WAIT_OBJECT_0,
     WAIT_TIMEOUT, WAIT_FAILED,
@@ -77,11 +77,7 @@ fn exe_dir() -> PathBuf {
 }
 
 fn log(msg: &str) {
-    let line = format!(
-        "[{}] {}\n",
-        chrono_now(),
-        msg
-    );
+    let line = format!("[{}] {}\n", timestamp(), msg);
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -91,8 +87,8 @@ fn log(msg: &str) {
     }
 }
 
-// minimal local timestamp without pulling in a crate
-fn chrono_now() -> String {
+// seconds since the Unix epoch -- no date formatting, avoids a crate dependency
+fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,46 +111,48 @@ fn read_start_pos() -> (f32, f32) {
     (DEF_PAN, DEF_TILT)
 }
 
-/// Read last_track.state: "1" = Follow (AI tracking), "0" = Standard (fixed).
-/// Defaults to true (Follow) if file is missing or unparseable.
+/// Read a state file next to the exe. Each holds "1" or "0".
+fn read_state(name: &str) -> Option<String> {
+    fs::read_to_string(exe_dir().join(name)).ok()
+}
+
+/// "1" = true, "0" = false; missing or unparseable = `default`.
+fn read_bool(name: &str, default: bool) -> bool {
+    match read_state(name).as_deref().map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
+
+/// None when the file is missing -> the caller leaves the device state untouched.
+fn read_opt_bool(name: &str) -> Option<bool> {
+    read_state(name).map(|s| s.trim() == "1")
+}
+
+/// Follow (AI tracking) vs Standard (fixed). Defaults to Follow.
 fn read_tracking() -> bool {
-    if let Ok(s) = fs::read_to_string(exe_dir().join("last_track.state")) {
-        return s.trim() != "0";
-    }
-    true
+    read_bool("last_track.state", true)
 }
 
-/// Read auto_privacy.state: "1" = park to Privacy on camera release, "0" = leave as-is.
-/// Defaults to true if file is missing.
+/// Park to Privacy when the camera is released, vs leave as-is. Defaults to on.
 fn read_auto_privacy() -> bool {
-    if let Ok(s) = fs::read_to_string(exe_dir().join("auto_privacy.state")) {
-        return s.trim() != "0";
-    }
-    true
+    read_bool("auto_privacy.state", true)
 }
 
-/// Read image_flip.state: Some(true) = image flipped 180° (upside-down mount),
-/// Some(false) = normal. None if the file is missing -> never touch the flip state.
+/// Image flipped 180° (upside-down mount).
 fn read_flip() -> Option<bool> {
-    fs::read_to_string(exe_dir().join("image_flip.state"))
-        .ok()
-        .map(|s| s.trim() == "1")
+    read_opt_bool("image_flip.state")
 }
 
-/// Read image_mirror.state: Some(true) = horizontal mirror on. None if the file
-/// is missing -> never touch the reverse state on mirror's account.
+/// Horizontal mirror.
 fn read_mirror() -> Option<bool> {
-    fs::read_to_string(exe_dir().join("image_mirror.state"))
-        .ok()
-        .map(|s| s.trim() == "1")
+    read_opt_bool("image_mirror.state")
 }
 
-/// Read api_server.state: "1" = run the local API server. Defaults to false (off).
+/// Run the local API server. Defaults to off.
 fn read_api_enabled() -> bool {
-    if let Ok(s) = fs::read_to_string(exe_dir().join("api_server.state")) {
-        return s.trim() == "1";
-    }
-    false
+    read_bool("api_server.state", false)
 }
 
 // ---- HID protocol -----------------------------------------------------------
@@ -173,16 +171,18 @@ fn frame(g: u8, p: u8, i: u8, payload: &[u8]) -> [u8; 32] {
     f
 }
 
-fn motor_pos(axis: u8, deg: f32) -> [u8; 32] {
+fn motor(axis: u8, deg: f32, index: u8) -> [u8; 32] {
     let mut pl = vec![axis];
     pl.extend_from_slice(&deg.to_le_bytes());
-    frame(0x63, 0x01, 0x00, &pl) // SET_MOTOR_POS
+    frame(0x63, 0x01, index, &pl)
+}
+
+fn motor_pos(axis: u8, deg: f32) -> [u8; 32] {
+    motor(axis, deg, 0x00) // SET_MOTOR_POS
 }
 
 fn motor_rel(axis: u8, deg: f32) -> [u8; 32] {
-    let mut pl = vec![axis];
-    pl.extend_from_slice(&deg.to_le_bytes());
-    frame(0x63, 0x01, 0x19, &pl) // MOVE_MOTOR_REL
+    motor(axis, deg, 0x19) // MOVE_MOTOR_REL
 }
 
 fn device_mode(m: u8) -> [u8; 32] {
@@ -382,15 +382,21 @@ unsafe fn walk(key: HKEY, depth: i32, max_start: &mut u64, max_stop: &mut u64) {
     }
 }
 
+/// Open HKCU\...\ConsentStore\webcam for reading. Caller closes the key.
+fn open_webcam_key() -> Option<HKEY> {
+    let wp = wide(WEBCAM);
+    let mut key = HKEY::default();
+    let r = unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(wp.as_ptr()), 0, KEY_READ, &mut key)
+    };
+    (r == ERROR_SUCCESS).then_some(key)
+}
+
 fn scan() -> (u64, u64) {
     let mut ms = 0u64;
     let mut mc = 0u64;
-    unsafe {
-        let mut key = HKEY::default();
-        let wp = wide(WEBCAM);
-        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(wp.as_ptr()), 0, KEY_READ, &mut key)
-            == ERROR_SUCCESS
-        {
+    if let Some(key) = open_webcam_key() {
+        unsafe {
             walk(key, 2, &mut ms, &mut mc);
             let _ = RegCloseKey(key);
         }
@@ -462,20 +468,25 @@ fn respond(c: &mut TcpStream, status: &str, body: &str) {
     );
 }
 
-fn query_f32(query: &str, key: &str) -> Option<f32> {
-    query
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| *k == key)
-        .and_then(|(_, v)| v.parse().ok())
-}
-
 fn query_str<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == key)
         .map(|(_, v)| v)
+}
+
+fn query_f32(query: &str, key: &str) -> Option<f32> {
+    query_str(query, key).and_then(|v| v.parse().ok())
+}
+
+/// Drive the camera, then reply 200 on success or 502 if it is unreachable.
+fn respond_send(c: &mut TcpStream, frames: &[[u8; 32]]) {
+    if send(frames) {
+        respond(c, "200 OK", "{\"ok\":true}");
+    } else {
+        respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
+    }
 }
 
 fn handle_client(c: &mut TcpStream) {
@@ -495,8 +506,11 @@ fn handle_client(c: &mut TcpStream) {
 
     match (method, path) {
         ("GET", "/") => {
-            respond(c, "200 OK",
-                "{\"name\":\"aperio\",\"port\":4750,\"endpoints\":[\"GET /\",\"GET /status\",\"POST /move?pan=X&tilt=Y\",\"POST /move_rel?pan=X&tilt=Y\",\"POST /mode?value=follow|standard|privacy\",\"POST /flip?value=on|off\",\"POST /mirror?value=on|off\",\"POST /home\",\"POST /shutdown\"]}");
+            let body = format!(
+                "{{\"name\":\"aperio\",\"port\":{},\"endpoints\":[\"GET /\",\"GET /status\",\"POST /move?pan=X&tilt=Y\",\"POST /move_rel?pan=X&tilt=Y\",\"POST /mode?value=follow|standard|privacy\",\"POST /flip?value=on|off\",\"POST /mirror?value=on|off\",\"POST /home\",\"POST /shutdown\"]}}",
+                API_PORT
+            );
+            respond(c, "200 OK", &body);
         }
         ("POST", "/shutdown") => {
             log("api: /shutdown -> disabling api server");
@@ -540,11 +554,7 @@ fn handle_client(c: &mut TcpStream) {
                 frames.push(if rel { motor_rel(2, t) } else { motor_pos(2, t) });
             }
             log(&format!("api: {} pan={:?} tilt={:?}", path, pan, tilt));
-            if send(&frames) {
-                respond(c, "200 OK", "{\"ok\":true}");
-            } else {
-                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
-            }
+            respond_send(c, &frames);
         }
         ("POST", "/mode") => {
             let m = match query_str(query, "value") {
@@ -557,11 +567,7 @@ fn handle_client(c: &mut TcpStream) {
                 }
             };
             log(&format!("api: /mode value={}", m));
-            if send(&[device_mode(m)]) {
-                respond(c, "200 OK", "{\"ok\":true}");
-            } else {
-                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
-            }
+            respond_send(c, &[device_mode(m)]);
         }
         ("POST", "/flip") | ("POST", "/mirror") => {
             let on = match query_str(query, "value") {
@@ -577,20 +583,12 @@ fn handle_client(c: &mut TcpStream) {
             let _ = fs::write(exe_dir().join(state), if on { "1\n" } else { "0\n" });
             let f = read_flip().unwrap_or(false);
             let m = read_mirror().unwrap_or(false);
-            if send(&[reverse_sta(1, f != m), reverse_sta(2, f)]) {
-                respond(c, "200 OK", "{\"ok\":true}");
-            } else {
-                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
-            }
+            respond_send(c, &[reverse_sta(1, f != m), reverse_sta(2, f)]);
         }
         ("POST", "/home") => {
             let (pan, tilt) = read_start_pos();
             log("api: /home");
-            if send(&[motor_pos(1, pan), motor_pos(2, tilt)]) {
-                respond(c, "200 OK", "{\"ok\":true}");
-            } else {
-                respond(c, "502 Bad Gateway", "{\"ok\":false,\"error\":\"camera not reachable\"}");
-            }
+            respond_send(c, &[motor_pos(1, pan), motor_pos(2, tilt)]);
         }
         _ => respond(c, "404 Not Found", "{\"ok\":false,\"error\":\"unknown endpoint\"}"),
     }
@@ -598,93 +596,120 @@ fn handle_client(c: &mut TcpStream) {
 
 // ---- daemon -----------------------------------------------------------------
 
+/// What woke the event loop.
+enum Wake {
+    /// Park grace period elapsed.
+    Timeout,
+    /// Camera consent store changed.
+    Registry,
+    /// Config dir changed (GUI toggle or api /shutdown).
+    ConfigDir,
+    Failed,
+}
+
+/// Arm an asynchronous registry-change notification on `key`, signalling `event`.
+fn arm_reg_notify(key: HKEY, event: HANDLE) -> bool {
+    unsafe {
+        let _ = ResetEvent(event);
+        RegNotifyChangeKeyValue(
+            key,
+            BOOL(1), // watch subtree
+            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+            event,
+            BOOL(1), // asynchronous (signal the event)
+        ) == ERROR_SUCCESS
+    }
+}
+
+fn wait_for(event: HANDLE, dir_notif: Option<HANDLE>, timeout_ms: u32) -> Wake {
+    let w = unsafe {
+        match dir_notif {
+            Some(dn) => WaitForMultipleObjects(&[event, dn], BOOL(0), timeout_ms),
+            None => WaitForSingleObject(event, timeout_ms),
+        }
+    };
+    if w == WAIT_TIMEOUT {
+        return Wake::Timeout;
+    }
+    if w == WAIT_FAILED {
+        return Wake::Failed;
+    }
+    match w.0.wrapping_sub(WAIT_OBJECT_0.0) {
+        0 => Wake::Registry,
+        1 => Wake::ConfigDir,
+        _ => Wake::Failed,
+    }
+}
+
 fn run_daemon() {
     log("aperio started (event-driven; idle = no device I/O)");
-    unsafe {
-        let wp = wide(WEBCAM);
-        let mut key = HKEY::default();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(wp.as_ptr()), 0, KEY_READ, &mut key)
-            != ERROR_SUCCESS
-        {
+
+    let key = match open_webcam_key() {
+        Some(k) => k,
+        None => {
             log("FATAL: cannot open webcam ConsentStore key");
             return;
         }
-        let event = match CreateEventW(None, BOOL(1), BOOL(0), PCWSTR::null()) {
-            Ok(e) => e,
-            Err(_) => {
-                log("FATAL: CreateEventW failed");
-                return;
-            }
-        };
-        // watch the config dir so GUI toggles / api shutdown apply immediately
-        let dir_w = wide(&exe_dir().to_string_lossy());
-        let dir_notif = FindFirstChangeNotificationW(
+    };
+    let event = match unsafe { CreateEventW(None, BOOL(1), BOOL(0), PCWSTR::null()) } {
+        Ok(e) => e,
+        Err(_) => {
+            log("FATAL: CreateEventW failed");
+            return;
+        }
+    };
+    // watch the config dir so GUI toggles / api shutdown apply immediately
+    let dir_w = wide(&exe_dir().to_string_lossy());
+    let dir_notif = unsafe {
+        FindFirstChangeNotificationW(
             PCWSTR(dir_w.as_ptr()),
             BOOL(0),
             FILE_NOTIFY_CHANGE_LAST_WRITE,
         )
-        .ok();
-        if dir_notif.is_none() {
-            log("WARN: config-dir watch unavailable; api toggle applies on camera events only");
+    }
+    .ok();
+    if dir_notif.is_none() {
+        log("WARN: config-dir watch unavailable; api toggle applies on camera events only");
+    }
+
+    let (mut last_open, mut last_close) = scan();
+    log(&format!("baseline open_ts={} close_ts={}", last_open, last_close));
+
+    let mut api: Option<ApiServer> = if read_api_enabled() {
+        start_api_server()
+    } else {
+        None
+    };
+    let mut reg_armed = false;
+    // Pending Privacy park: set when all apps release the camera, executed
+    // PARK_DELAY later unless an app reopens the camera in the meantime.
+    let mut park_at: Option<std::time::Instant> = None;
+
+    loop {
+        if !reg_armed {
+            if !arm_reg_notify(key, event) {
+                log("FATAL: RegNotifyChangeKeyValue failed");
+                break;
+            }
+            reg_armed = true;
         }
 
-        let (mut last_open, mut last_close) = scan();
-        log(&format!("baseline open_ts={} close_ts={}", last_open, last_close));
-
-        let mut api: Option<ApiServer> = if read_api_enabled() {
-            start_api_server()
-        } else {
-            None
+        let timeout_ms = match park_at {
+            Some(t) => t
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u32,
+            None => INFINITE,
         };
-        let mut reg_armed = false;
-        // Pending Privacy park: set when all apps release the camera, executed
-        // PARK_DELAY later unless an app reopens the camera in the meantime.
-        let mut park_at: Option<std::time::Instant> = None;
 
-        loop {
-            if !reg_armed {
-                let _ = ResetEvent(event);
-                let r = RegNotifyChangeKeyValue(
-                    key,
-                    BOOL(1), // watch subtree
-                    REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
-                    event,
-                    BOOL(1), // asynchronous (signal the event)
-                );
-                if r != ERROR_SUCCESS {
-                    log("FATAL: RegNotifyChangeKeyValue failed");
-                    break;
-                }
-                reg_armed = true;
-            }
-
-            let timeout_ms = match park_at {
-                Some(t) => t
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_millis() as u32,
-                None => INFINITE,
-            };
-            let w = match dir_notif {
-                Some(dn) => WaitForMultipleObjects(&[event, dn], BOOL(0), timeout_ms),
-                None => WaitForSingleObject(event, timeout_ms),
-            };
-            let fired = if w == WAIT_TIMEOUT {
-                u32::MAX // park grace period elapsed
-            } else if w == WAIT_FAILED {
-                log("FATAL: wait failed");
-                break;
-            } else {
-                w.0.wrapping_sub(WAIT_OBJECT_0.0)
-            };
-
-            if fired == u32::MAX {
+        match wait_for(event, dir_notif, timeout_ms) {
+            Wake::Timeout => {
                 // no reopen within the grace period -> park now
                 park_at = None;
                 if read_auto_privacy() {
                     on_inactive();
                 }
-            } else if fired == 0 {
-                // registry (camera consent store) changed
+            }
+            Wake::Registry => {
                 reg_armed = false;
                 thread::sleep(Duration::from_millis(300)); // debounce burst of writes
 
@@ -713,25 +738,28 @@ fn run_daemon() {
                     ));
                     park_at = Some(std::time::Instant::now() + PARK_DELAY);
                 }
-            } else if fired == 1 {
-                // config dir changed (GUI toggle or api /shutdown)
+            }
+            Wake::ConfigDir => {
                 thread::sleep(Duration::from_millis(150)); // let the write finish
                 if let Some(dn) = dir_notif {
-                    let _ = FindNextChangeNotification(dn);
+                    let _ = unsafe { FindNextChangeNotification(dn) };
                 }
-            } else {
+            }
+            Wake::Failed => {
                 log("FATAL: wait failed");
                 break;
             }
-
-            // apply the API-server toggle
-            let want_api = read_api_enabled();
-            if want_api && api.is_none() {
-                api = start_api_server();
-            } else if !want_api && api.is_some() {
-                stop_api_server(api.take().unwrap());
-            }
         }
+
+        // apply the API-server toggle
+        let want_api = read_api_enabled();
+        if want_api && api.is_none() {
+            api = start_api_server();
+        } else if !want_api && api.is_some() {
+            stop_api_server(api.take().unwrap());
+        }
+    }
+    unsafe {
         let _ = RegCloseKey(key);
     }
 }
