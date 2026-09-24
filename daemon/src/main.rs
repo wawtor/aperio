@@ -76,12 +76,22 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Per-user folder for settings and the log: %LOCALAPPDATA%\Aperio. Under
+/// Program Files the exe folder is read-only for the user the daemon runs as.
+fn config_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("Aperio"))
+        .unwrap_or_else(exe_dir)
+}
+
 fn log(msg: &str) {
     let line = format!("[{}] {}\n", timestamp(), msg);
+    let dir = config_dir();
+    let _ = fs::create_dir_all(&dir);
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(exe_dir().join("aperio.log"))
+        .open(dir.join("aperio.log"))
     {
         let _ = f.write_all(line.as_bytes());
     }
@@ -102,7 +112,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn read_start_pos() -> (f32, f32) {
-    if let Ok(s) = fs::read_to_string(exe_dir().join("start_pos.txt")) {
+    if let Some(s) = read_state("start_pos.txt") {
         let parts: Vec<f32> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
         if parts.len() >= 2 {
             return (parts[0], parts[1]);
@@ -111,9 +121,18 @@ fn read_start_pos() -> (f32, f32) {
     (DEF_PAN, DEF_TILT)
 }
 
-/// Read a state file next to the exe. Each holds "1" or "0".
+/// Read a config file from the per-user folder, falling back to the exe
+/// folder, where versions before 0.3.0 kept it.
 fn read_state(name: &str) -> Option<String> {
-    fs::read_to_string(exe_dir().join(name)).ok()
+    fs::read_to_string(config_dir().join(name))
+        .or_else(|_| fs::read_to_string(exe_dir().join(name)))
+        .ok()
+}
+
+fn write_state(name: &str, contents: &str) {
+    let dir = config_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join(name), contents);
 }
 
 /// "1" = true, "0" = false; missing or unparseable = `default`.
@@ -514,7 +533,7 @@ fn handle_client(c: &mut TcpStream) {
         }
         ("POST", "/shutdown") => {
             log("api: /shutdown -> disabling api server");
-            let _ = fs::write(exe_dir().join("api_server.state"), "0\n");
+            write_state("api_server.state", "0\n");
             respond(c, "200 OK", "{\"ok\":true,\"note\":\"api server disabled\"}");
         }
         ("GET", "/status") => {
@@ -580,7 +599,7 @@ fn handle_client(c: &mut TcpStream) {
             };
             log(&format!("api: {} value={}", path, on));
             let state = if path == "/flip" { "image_flip.state" } else { "image_mirror.state" };
-            let _ = fs::write(exe_dir().join(state), if on { "1\n" } else { "0\n" });
+            write_state(state, if on { "1\n" } else { "0\n" });
             let f = read_flip().unwrap_or(false);
             let m = read_mirror().unwrap_or(false);
             respond_send(c, &[reverse_sta(1, f != m), reverse_sta(2, f)]);
@@ -659,7 +678,9 @@ fn run_daemon() {
         }
     };
     // watch the config dir so GUI toggles / api shutdown apply immediately
-    let dir_w = wide(&exe_dir().to_string_lossy());
+    let dir = config_dir();
+    let _ = fs::create_dir_all(&dir);
+    let dir_w = wide(&dir.to_string_lossy());
     let dir_notif = unsafe {
         FindFirstChangeNotificationW(
             PCWSTR(dir_w.as_ptr()),

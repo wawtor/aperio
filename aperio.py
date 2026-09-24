@@ -23,8 +23,12 @@ except ImportError:
         "hidapi is not installed.\n\nRun:  pip install hidapi\n\nthen relaunch Aperio.")
     raise SystemExit(1)
 
-HERE         = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-STARTPOSFILE = os.path.join(HERE, "start_pos.txt")
+HERE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+# Settings live in a per-user folder shared with the daemon: under Program
+# Files the install folder is read-only for normal users. Versions before
+# 0.3.0 kept them in HERE, which is still read as a fallback.
+CONFIG_DIR = (os.path.join(os.environ["LOCALAPPDATA"], "Aperio")
+              if os.environ.get("LOCALAPPDATA") else HERE)
 
 # attr -> (state file, label, default, description). Single source for loading,
 # saving and the settings rows; the daemon reads the same files.
@@ -578,30 +582,41 @@ def _move_abs(h, axis, deg):
 
 # ---- config helpers ----
 
-def _state_path(attr):
-    return os.path.join(HERE, TOGGLES[attr][0])
+def _read_config(name):
+    """A config file's contents, or None. The per-user folder wins over the
+    install folder, where versions before 0.3.0 kept it."""
+    for d in (CONFIG_DIR, HERE):
+        try:
+            with open(os.path.join(d, name)) as f:
+                return f.read()
+        except OSError:
+            pass
+    return None
+
+def _write_config(name, text):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(os.path.join(CONFIG_DIR, name), "w") as f:
+        f.write(text)
 
 def _load_toggle(attr):
     try:
-        return bool(int(open(_state_path(attr)).read().strip()))
+        return bool(int(_read_config(TOGGLES[attr][0]).strip()))
     except Exception:
         return TOGGLES[attr][2]
 
 def _write_toggle(attr, on):
-    with open(_state_path(attr), "w") as f:
-        f.write("1\n" if on else "0\n")
+    _write_config(TOGGLES[attr][0], "1\n" if on else "0\n")
 
 def _load_start_pos():
     """Saved (pan, tilt), or None if no startup position has been saved."""
     try:
-        p = open(STARTPOSFILE).read().split()
+        p = _read_config("start_pos.txt").split()
         return float(p[0]), float(p[1])
     except Exception:
         return None
 
 def _save_config(pan, tilt, values):
-    with open(STARTPOSFILE, "w") as f:
-        f.write("%.2f %.2f\n" % (pan, tilt))
+    _write_config("start_pos.txt", "%.2f %.2f\n" % (pan, tilt))
     for attr, on in values.items():
         _write_toggle(attr, on)
 
@@ -891,7 +906,7 @@ class App(tk.Tk):
 
     def _write_failed(self, e):
         messagebox.showerror("Couldn't save settings",
-            "Aperio couldn't write its settings to:\n%s\n\n%s" % (HERE, getattr(e, "strerror", None) or e),
+            "Aperio couldn't write its settings to:\n%s\n\n%s" % (CONFIG_DIR, getattr(e, "strerror", None) or e),
             parent=self)
 
     def _set_toggle(self, attr, on):

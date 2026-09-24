@@ -195,7 +195,10 @@ deck buttons, or OBS scripts.
 | `uninstall.bat` | Remove the scheduled task, `aperio` command, and PATH entry |
 | `research/` | Protocol research, diagnostic tool, per-camera data |
 
-Config files are created by `aperio.py` on first save and live alongside the exe:
+Settings are created by the setup GUI on first save and live in
+`%LOCALAPPDATA%\Aperio`, together with the daemon's log. (Before 0.3.0 they
+were kept next to the exe; files left there are still read until a newer
+copy is saved.)
 
 | File | Content |
 |---|---|
@@ -206,6 +209,7 @@ Config files are created by `aperio.py` on first save and live alongside the exe
 | `image_flip.state` | Image flip 180° on/off (1/0; absent = never touch flip) |
 | `image_mirror.state` | Horizontal mirror on/off (1/0; absent = never touch mirror) |
 | `api_server.state` | Local API server on/off (1/0, default off) |
+| `aperio.log` | Daemon log |
 
 ---
 

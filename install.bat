@@ -36,5 +36,5 @@ echo Aperio daemon installed ^(runs at logon^).
 echo   Setup GUI  : aperio   ^(from any new terminal^)
 echo   Start now  : schtasks /Run /TN Aperio
 echo   Stop now   : taskkill /IM aperio.exe /F
-echo   Log file   : %~dp0aperio.log
+echo   Log file   : %LOCALAPPDATA%\Aperio\aperio.log
 echo   Uninstall  : uninstall.bat
