@@ -87,15 +87,22 @@ python aperio.py
 ```
 
 - **Drag the joystick** to pan/tilt the camera to your preferred position
-- Or **type coordinates** directly (Pan ±150°, Tilt ±90°)
-- Toggle **AI Tracking** — camera follows your face when in use
-- Toggle **Auto Privacy** — lens parks down when no app is using the camera
-- Toggle **Flip image** — 180° rotation for cameras mounted upside-down (hanging)
-- Toggle **Mirror image** — horizontally mirror the video
-- Toggle **Local API server** — control the camera from your own apps (off by default)
-- Click **Save**, then close — the position is also programmed into the camera
-  itself as its power-on default, so the lens rises already aimed at it when it
-  wakes (no visible correction move)
+- Or **type coordinates** into *Go to* (Pan ±150°, Tilt ±90°) — leave one blank
+  to keep that axis where it is
+- Click **Save current position** — the position is also programmed into the
+  camera itself as its power-on default, so the lens rises already aimed at it
+  when it wakes (no visible correction move)
+
+Settings apply as soon as you flip them — there is nothing else to save:
+
+- **AI tracking** — camera follows your face when in use
+- **Auto privacy** — lens parks down when no app is using the camera
+- **Flip image** — 180° rotation for cameras mounted upside-down (hanging)
+- **Mirror image** — horizontally mirror the video
+- **Invert joystick** — reverse the drag direction in the setup window
+- **Local API server** — control the camera from your own apps (off by default)
+
+The window follows the Windows light/dark app theme.
 
 ### 3. Install the daemon
 
@@ -171,9 +178,9 @@ curl -X POST http://127.0.0.1:4750/home
 All settings toggles apply immediately — the daemon watches its config
 directory, so flipping the API server on or off (in the GUI or via
 `POST /shutdown`) takes effect within a second, no restart or camera event
-needed. Click the **?** next to the toggle in the GUI for a quick reference
-of the endpoints — handy when wiring up your own joystick, stream deck
-buttons, or OBS scripts.
+needed. Click **View endpoints** under the toggle in the GUI for a quick
+reference of the endpoints — handy when wiring up your own joystick, stream
+deck buttons, or OBS scripts.
 
 ---
 
@@ -181,7 +188,7 @@ buttons, or OBS scripts.
 
 | File | Purpose |
 |---|---|
-| `aperio.py` | Setup GUI — set startup position, toggle settings, save |
+| `aperio.py` | Setup GUI — set and save the startup position, toggle settings |
 | `aperio.exe` | Background daemon (build from `daemon/`) |
 | `daemon/` | Rust source for the daemon |
 | `install.bat` | Register daemon as a logon task + add the `aperio` command to PATH |
