@@ -7,7 +7,7 @@ coordinates directly, then save it as the startup position. Settings apply
 as soon as they are toggled: the Aperio daemon (aperio.exe) watches the
 config files and runs silently in the background.
 
-Requirements: pip install hidapi
+Requirements: pip install hidapi pillow
 """
 import os, sys, math, struct, threading, time, zlib, base64
 import tkinter as tk
@@ -16,11 +16,11 @@ from tkinter import messagebox
 
 try:
     import hid
-except ImportError:
-    import tkinter as _tk
-    _r = _tk.Tk(); _r.withdraw()
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
+except ImportError as _e:
+    _r = tk.Tk(); _r.withdraw()
     messagebox.showerror("Missing dependency",
-        "hidapi is not installed.\n\nRun:  pip install hidapi\n\nthen relaunch Aperio.")
+        "%s\n\nRun:  pip install hidapi pillow\n\nthen relaunch Aperio." % _e)
     raise SystemExit(1)
 
 HERE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
@@ -71,36 +71,43 @@ def S(v):
     return int(round(v * SCALE))
 
 
-# ---- theme: Windows 11 colours, following the system light/dark setting ----
+# ---- theme: macOS colours, following the system light/dark setting ----
 
 class _Theme(dict):
     __getattr__ = dict.__getitem__
 
 DARK = _Theme(
-    dark=True, bg="#202020", card="#2b2b2b", card_hover="#323232", card_press="#272727",
-    card_edge="#1d1d1d", text="#ffffff", text2="#cfcfcf", text3="#9e9e9e", text_off="#787878",
-    accent="#60cdff", accent_hover="#5bbdea", accent_press="#55add5", on_accent="#000000",
-    accent_off="#4c4c4c", on_accent_off="#ababab", link="#99ebff",
-    ctl="#383838", ctl_hover="#3d3d3d", ctl_press="#323232", ctl_edge="#454545",
-    ctl_strong="#9e9e9e", field_focus="#222222", sw_off="#272727", sw_off_hover="#343434",
-    sw_knob="#d1d1d1", well="#262626", well_edge="#3a3a3a", well_line="#313131",
-    knob="#454545", knob_edge="#525252", focus="#ffffff", ok="#6ccb5f", bad="#ff99a4",
+    dark=True, bg="#1e1e1e", card="#2a2a2c", card_edge="#353538", sep="#3a3a3d",
+    text="#ececee", text2="#98989d", text3="#6c6c71", text_off="#5c5c60",
+    accent="#0a84ff", accent_hover="#2a94ff", accent_press="#0070e0", on_accent="#ffffff",
+    accent_off="#3a3a3d", on_accent_off="#7c7c80", link="#3d9bff",
+    ctl="#4a4a4d", ctl_hover="#545458", ctl_press="#5f5f63", ctl_edge="#58585c",
+    field="#1f1f21", field_edge="#434346", sw_off="#3d3d40", sw_knob="#ffffff",
+    sw_knob_edge="#c8c8cc", ok="#30d158", bad="#ff6961",
+    well_top="#141416", well_bot="#1d1d20", well_edge="#3a3a3e", well_line="#2a2a2e",
+    well_mark="#4c4c51", well_shade=170,
+    glass_top=(205, 225, 255, 51), glass_bot=(120, 170, 255, 18), glass_shadow=0.55,
+    glass_edge=None,
 )
 LIGHT = _Theme(
-    dark=False, bg="#f3f3f3", card="#fbfbfb", card_hover="#f6f6f6", card_press="#f2f2f2",
-    card_edge="#e5e5e5", text="#1a1a1a", text2="#5f5f5f", text3="#8b8b8b", text_off="#a0a0a0",
-    accent="#005fb8", accent_hover="#196fbf", accent_press="#327ec5", on_accent="#ffffff",
-    accent_off="#c5c5c5", on_accent_off="#ffffff", link="#003e92",
-    ctl="#fefefe", ctl_hover="#f9f9f9", ctl_press="#f4f4f4", ctl_edge="#e5e5e5",
-    ctl_strong="#868686", field_focus="#ffffff", sw_off="#f5f5f5", sw_off_hover="#ececec",
-    sw_knob="#5f5f5f", well="#f3f3f3", well_edge="#dddddd", well_line="#e6e6e6",
-    knob="#ffffff", knob_edge="#cccccc", focus="#1a1a1a", ok="#0f7b0f", bad="#c42b1c",
+    dark=False, bg="#ececec", card="#ffffff", card_edge="#dcdcdf", sep="#e3e3e6",
+    text="#1d1d1f", text2="#6e6e73", text3="#8e8e93", text_off="#b0b0b5",
+    accent="#007aff", accent_hover="#1a87ff", accent_press="#0062cc", on_accent="#ffffff",
+    accent_off="#d1d1d6", on_accent_off="#ffffff", link="#0066d6",
+    ctl="#ffffff", ctl_hover="#f7f7f7", ctl_press="#ececee", ctl_edge="#c8c8cc",
+    field="#ffffff", field_edge="#c8c8cc", sw_off="#e3e3e6", sw_knob="#ffffff",
+    sw_knob_edge="#d4d4d8", ok="#248a3d", bad="#d70015",
+    well_top="#dcdce1", well_bot="#eaeaee", well_edge="#cfcfd4", well_line="#d6d6db",
+    well_mark="#a8a8ae", well_shade=60,
+    glass_top=(255, 255, 255, 150), glass_bot=(225, 236, 255, 80), glass_shadow=0.28,
+    glass_edge=(0, 0, 0, 38),
 )
 T = DARK        # active theme, picked by _init_style()
 BORDER = 1      # hairline width in px, scaled by _init_style()
+SS = 4          # supersampling factor for the Pillow-rendered joystick
 
 class F:
-    """Fonts (Windows 11 type ramp, sized in px), filled in by _init_style()."""
+    """Fonts (sized in px), filled in by _init_style()."""
 
 def _reg_dword(path, name):
     try:
@@ -117,15 +124,34 @@ def _prefers_light():
 def _init_style():
     global T, BORDER
     T = LIGHT if _prefers_light() else DARK
+    T.focus = _mix(T.accent, T.bg, 0.45)        # focus ring, accent at ~50%
+    T.bad_ring = _mix(T.bad, T.bg, 0.45)
     BORDER = max(1, int(SCALE))
-    F.title   = ("Segoe UI Semibold", -S(20))
-    F.strong  = ("Segoe UI Semibold", -S(14))
-    F.body    = ("Segoe UI", -S(14))
-    F.caption = ("Segoe UI", -S(12))
-    F.mono    = ("Consolas", -S(13))
+    fams = set(tkfont.families())
+    pick = lambda *names: next((n for n in names if n in fams), names[-1])
+    text = pick("Segoe UI Variable Text", "Segoe UI")
+    semi = pick("Segoe UI Variable Text Semibold", "Segoe UI Semibold")
+    disp = pick("Segoe UI Variable Display Semib", "Segoe UI Variable Display Semibold",
+                "Segoe UI Semibold")
+    F.title   = (disp, -S(20))
+    F.strong  = (semi, -S(13))
+    F.body    = (text, -S(13))
+    F.caption = (text, -S(11))
+    F.mono    = (pick("Cascadia Mono", "Consolas"), -S(12))
 
 def _rgb(c):
     return int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+
+def _mix(a, b, t):
+    a, b = _rgb(a), _rgb(b)
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+def _ease_out(u):
+    return 1 - (1 - u) ** 3
+
+def _ease_out_back(u, k=1.25):
+    u -= 1
+    return 1 + (k + 1) * u ** 3 + k * u ** 2
 
 def _deg(v):
     if abs(v) < 0.05:
@@ -196,6 +222,140 @@ def _shape(w, h, r, layers, band=None):
     return img
 
 
+# ---- joystick rendering (Pillow: blur and translucency for the glass puck) ----
+
+def _ss(v):
+    """Logical px -> supersampled device px."""
+    return int(round(v * SCALE * SS))
+
+def _pmask(size, box, radius, fill=255):
+    m = Image.new("L", size, 0)
+    ImageDraw.Draw(m).rounded_rectangle([int(v) for v in box], int(radius), fill=fill)
+    return m
+
+def _circ(c, r, dx=0, dy=0):
+    return (c - r + dx, c - r + dy, c + r + dx, c + r + dy)
+
+def _player(im, color, mask):
+    """Composite a flat colour through `mask` onto `im`."""
+    if len(color) == 4 and color[3] != 255:
+        a = color[3]
+        mask = mask.point(lambda v: v * a // 255)
+    c = Image.new("RGBA", im.size, color[:3] + (0,))
+    c.putalpha(mask)
+    return Image.alpha_composite(im, c)
+
+def _pgradient(im, box, radius, top, bot):
+    """Composite a vertical-gradient rounded rect onto `im`."""
+    x0, y0, x1, y1 = [int(v) for v in box]
+    h = max(2, y1 - y0)
+    g = Image.new("RGBA", (1, h))
+    g.putdata([tuple(int(top[i] + (bot[i] - top[i]) * y / (h - 1)) for i in range(4))
+               for y in range(h)])
+    full = Image.new("RGBA", im.size, top[:3] + (0,))
+    full.paste(g.resize((max(1, x1 - x0), h)), (x0, y0))
+    full.putalpha(ImageChops.multiply(full.getchannel("A"), _pmask(im.size, box, radius)))
+    return Image.alpha_composite(im, full)
+
+def _well_img(R, M, active):
+    """Recessed circular joystick well, R = radius, M = margin for the glow."""
+    D = 2 * (R + M)
+    im = Image.new("RGBA", (D * SS, D * SS), (0, 0, 0, 0))
+    c, Rs = (R + M) * SS, R * SS
+    if active:
+        glow = _pmask(im.size, _circ(c, Rs + _ss(1)), Rs).filter(ImageFilter.GaussianBlur(_ss(5)))
+        im = _player(im, _rgb(T.accent) + (140,), glow)
+    b = _ss(1.5) if active else BORDER * SS
+    im = _player(im, _rgb(T.accent if active else T.well_edge) + (255,),
+                 _pmask(im.size, _circ(c, Rs), Rs))
+    ri = Rs - b
+    im = _pgradient(im, _circ(c, ri), ri, _rgb(T.well_top) + (255,), _rgb(T.well_bot) + (255,))
+
+    # inner shadow along the top edge
+    inner = _pmask(im.size, _circ(c, ri), ri)
+    hole = _pmask(im.size, _circ(c, ri, dy=_ss(6)), ri)
+    sh = ImageChops.subtract(inner, hole).filter(ImageFilter.GaussianBlur(_ss(7)))
+    im = _player(im, (0, 0, 0, T.well_shade), ImageChops.multiply(sh, inner))
+
+    # guides
+    g = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(g)
+    lw = BORDER * SS
+    line = _rgb(T.well_line) + (255,)
+    d.ellipse(_circ(c, int(Rs * 0.55)), outline=line, width=lw)
+    arm = Rs - _ss(14)
+    d.line([(c - arm, c), (c + arm, c)], fill=line, width=lw)
+    d.line([(c, c - arm), (c, c + arm)], fill=line, width=lw)
+    ch, w = Rs - _ss(14), _ss(4)
+    mark = _rgb(_mix(T.well_mark, T.accent, 0.7) if active else T.well_mark) + (255,)
+    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+        tx, ty = c + dx * ch, c + dy * ch
+        px, py = -dy, dx
+        d.polygon([(tx + dx * w, ty + dy * w),
+                   (tx + px * w - dx * _ss(1), ty + py * w - dy * _ss(1)),
+                   (tx - px * w - dx * _ss(1), ty - py * w - dy * _ss(1))], fill=mark)
+    d.ellipse(_circ(c, _ss(2.5)), fill=line)
+    im = Image.alpha_composite(im, g)
+    return im.resize((D, D), Image.LANCZOS)
+
+def _puck_img(P, M, k):
+    """Liquid-glass puck. P = radius, M = margin, k = press amount 0..1."""
+    D = 2 * (P + M)
+    im = Image.new("RGBA", (D * SS, D * SS), (0, 0, 0, 0))
+    c = (P + M) * SS
+    r = P * SS * (1 + 0.08 * k)
+    disc = _pmask(im.size, _circ(c, r), r)
+
+    # soft drop shadow, kept outside the glass so the lens stays clear
+    sh = _pmask(im.size, _circ(c, r, dy=_ss(3 + 2 * k)), r, int(255 * T.glass_shadow))
+    sh = ImageChops.subtract(sh.filter(ImageFilter.GaussianBlur(_ss(6 + 2 * k))), disc)
+    im = _player(im, (0, 0, 0), sh)
+    if k > 0:
+        glow = _pmask(im.size, _circ(c, r + _ss(2)), r).filter(ImageFilter.GaussianBlur(_ss(7)))
+        im = _player(im, _rgb(T.accent) + (int(128 * k),), ImageChops.subtract(glow, disc))
+
+    # glass body, tinting toward the accent while pressed
+    top, bot = T.glass_top, T.glass_bot
+    acc = _rgb(T.accent)
+    bot = tuple(int(bot[i] + (acc[i] - bot[i]) * 0.25 * k) for i in range(3)) + (int(bot[3] + 30 * k),)
+    im = _pgradient(im, _circ(c, r), r, top, bot)
+
+    # refraction band brightening toward the rim
+    band = ImageChops.subtract(disc, _pmask(im.size, _circ(c, r * 0.70), r * 0.70))
+    band = ImageChops.multiply(band.filter(ImageFilter.GaussianBlur(_ss(4))), disc)
+    im = _player(im, (255, 255, 255, 46), band)
+
+    # top-left specular highlight
+    spec = Image.new("L", im.size, 0)
+    ImageDraw.Draw(spec).ellipse([int(c - 0.62 * r), int(c - 0.80 * r),
+                                  int(c + 0.18 * r), int(c - 0.30 * r)], fill=255)
+    spec = ImageChops.multiply(spec.filter(ImageFilter.GaussianBlur(r * 0.10)), disc)
+    im = _player(im, (255, 255, 255, 120), spec)
+
+    # bottom caustic
+    cr = r * 0.86
+    caus = ImageChops.subtract(_pmask(im.size, _circ(c, cr, dy=r * 0.08), cr),
+                               _pmask(im.size, _circ(c, cr, dy=-r * 0.02), cr))
+    caus = ImageChops.multiply(caus.filter(ImageFilter.GaussianBlur(_ss(2))), disc)
+    im = _player(im, (200, 225, 255, 90), caus)
+
+    # rim: specular stroke, brightest at top-left with a weaker bounce at bottom-right
+    rw = max(SS, _ss(1.4))
+    ring = ImageChops.subtract(disc, _pmask(im.size, _circ(c, r - rw), r - rw))
+    if T.glass_edge:
+        im = _player(im, T.glass_edge, ring)
+    ang = Image.new("L", im.size, 0)
+    d = ImageDraw.Draw(ang)
+    tl, br = math.radians(225), math.radians(45)
+    for a in range(0, 360, 2):
+        th = math.radians(a + 1)
+        v = (0.22 + 0.78 * max(0.0, math.cos(th - tl)) ** 2
+                  + 0.40 * max(0.0, math.cos(th - br)) ** 3)
+        d.pieslice([int(v_) for v_ in _circ(c, r + SS)], a, a + 3, fill=int(255 * min(1.0, v)))
+    im = _player(im, (255, 255, 255), ImageChops.multiply(ang, ring))
+    return im.resize((D, D), Image.LANCZOS)
+
+
 # ---- window chrome ----
 
 def _set_icon(win):
@@ -247,7 +407,7 @@ class _Card(tk.Frame):
     colour showing around `body`, and each corner is capped with an
     anti-aliased arc."""
 
-    def __init__(self, parent, outside, radius=8):
+    def __init__(self, parent, outside, radius=10):
         super().__init__(parent, bg=T.card_edge, bd=0, highlightthickness=0)
         self.body = _panel(self, T.card)
         self.body.pack(fill="both", expand=True, padx=BORDER, pady=BORDER)
@@ -269,25 +429,25 @@ class _Card(tk.Frame):
 
 
 class _Switch(tk.Canvas):
-    """Windows 11 toggle switch. Click or Space flips it; command(on) returns
-    False to refuse the change."""
+    """macOS-style switch. Click or Space flips it; command(on) returns False
+    to refuse the change."""
 
     def __init__(self, parent, on, command, bg):
         self._m = m = S(4)                                 # room for the focus ring
-        self._size = w, h = S(40), S(20)
+        self._size = w, h = S(38), S(22)
         super().__init__(parent, width=w + 2 * m, height=h + 2 * m, bg=bg, bd=0,
-                         highlightthickness=0, takefocus=1, cursor="hand2")
-        self._on, self._cmd, self._hover, self._job = on, command, False, None
+                         highlightthickness=0, takefocus=1)
+        self._on, self._cmd, self._job = on, command, None
         self._pos = 1.0 if on else 0.0
         self._ring = self.create_image(0, 0, anchor="nw", state="hidden",
-            image=_shape(w + 2 * m, h + 2 * m, h / 2 + m, ((0, T.focus, S(2)),)))
+            image=_shape(w + 2 * m, h + 2 * m, h / 2 + m, ((0, T.focus, S(3)),)))
         self._track = self.create_image(m, m, anchor="nw")
-        self._knob = self.create_image(0, 0)
+        d = h - 2 * S(2)
+        self._knob = self.create_image(0, 0, image=_shape(d, d, d / 2,
+                                       ((0, T.sw_knob_edge, 0), (BORDER, T.sw_knob, 0))))
         self._paint()
         self.bind("<ButtonRelease-1>", self._release)
         self.bind("<space>", lambda _e: self.toggle())
-        self.bind("<Enter>", lambda _e: self._set_hover(True))
-        self.bind("<Leave>", lambda _e: self._set_hover(False))
         self.bind("<FocusIn>", lambda _e: self.itemconfigure(self._ring, state="normal"))
         self.bind("<FocusOut>", lambda _e: self.itemconfigure(self._ring, state="hidden"))
 
@@ -298,45 +458,34 @@ class _Switch(tk.Canvas):
         self._on = on
         if self._job:
             self.after_cancel(self._job)
-        self._slide(self._pos, 1.0 if on else 0.0, 1)
+        self._slide(self._pos, 1.0 if on else 0.0, time.perf_counter())
 
     def _release(self, e):
         if 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height():
             self.toggle()
 
-    def _slide(self, src, dst, step, steps=6):
-        u = 1 - (1 - step / steps) ** 2
-        self._pos = src + (dst - src) * u
+    def _slide(self, src, dst, t0, ms=240):
+        u = min(1.0, (time.perf_counter() - t0) * 1000 / ms)
+        self._pos = src + (dst - src) * _ease_out_back(u)
         self._paint()
-        self._job = self.after(16, self._slide, src, dst, step + 1) if step < steps else None
-
-    def _set_hover(self, on):
-        self._hover = on
-        self._paint()
+        self._job = self.after(12, self._slide, src, dst, t0) if u < 1.0 else None
 
     def _paint(self):
         (w, h), m = self._size, self._m
-        if self._on:
-            track = ((0, T.accent_hover if self._hover else T.accent, 0),)
-            knob = T.on_accent
-        else:
-            track = ((0, T.ctl_strong, 0),
-                     (BORDER, T.sw_off_hover if self._hover else T.sw_off, 0))
-            knob = T.sw_knob
-        d = S(14 if self._hover else 12)
-        self.itemconfigure(self._track, image=_shape(w, h, h / 2, track))
-        self.itemconfigure(self._knob, image=_shape(d, d, d / 2, ((0, knob, 0),)))
+        p = round(max(0.0, min(1.0, self._pos)) * 10) / 10     # colour steps, for the cache
+        self.itemconfigure(self._track, image=_shape(w, h, h / 2,
+                           ((0, _mix(T.sw_off, T.accent, p), 0),)))
         self.coords(self._knob, m + h / 2 + (w - h) * self._pos, m + h / 2)
 
 
 class _Button(tk.Canvas):
-    """Rounded push button; accent=True for the primary action."""
+    """Capsule push button; accent=True for the primary action."""
 
     def __init__(self, parent, text, command, bg, accent=False, width=0):
-        self._m = m = S(3)                                 # room for the focus ring
+        self._m = m = S(4)                                 # room for the focus ring
         w = width or _font(F.body).measure(text) + S(24)
-        super().__init__(parent, width=w + 2 * m, height=S(32) + 2 * m, bg=bg, bd=0,
-                         highlightthickness=0, takefocus=1, cursor="hand2")
+        super().__init__(parent, width=w + 2 * m, height=S(30) + 2 * m, bg=bg, bd=0,
+                         highlightthickness=0, takefocus=1)
         self._text, self._cmd, self._accent = text, command, accent
         self._state, self._enabled, self._flash_job = "rest", True, None
         self._bg = self.create_image(m, m, anchor="nw")
@@ -360,7 +509,7 @@ class _Button(tk.Canvas):
     def set_enabled(self, on):
         if on != self._enabled:
             self._enabled = on
-            self.configure(cursor="hand2" if on else "", takefocus=int(on))
+            self.configure(takefocus=int(on))
             self._paint()
 
     def flash(self, text, ms=1600):
@@ -393,33 +542,30 @@ class _Button(tk.Canvas):
             fill = {"rest": T.ctl, "hover": T.ctl_hover, "press": T.ctl_press, "off": T.ctl}[st]
             layers = ((0, T.ctl_edge, 0), (BORDER, fill, 0))
             fg = T.text if self._enabled else T.text_off
-        self.itemconfigure(self._bg, image=_shape(w, h, S(4), layers))
-        self.itemconfigure(self._ring, image=_shape(W, H, S(4) + m, ((0, T.focus, S(2)),)))
+        self.itemconfigure(self._bg, image=_shape(w, h, h / 2, layers))
+        self.itemconfigure(self._ring, image=_shape(W, H, H / 2, ((0, T.focus, S(3)),)))
         self.itemconfigure(self._label, fill=fg)
         self.coords(self._label, W / 2, H / 2)
 
 
 class _Field(tk.Canvas):
-    """Windows 11 text box: a flat tk.Entry on a rounded, underlined backdrop."""
+    """macOS text field: a flat tk.Entry on a rounded backdrop with a focus ring."""
 
     def __init__(self, parent, width, on_enter, bg):
-        self._size = w, h = S(width), S(32)
-        super().__init__(parent, width=w, height=h, bg=bg, bd=0, highlightthickness=0,
-                         cursor="xterm")
+        self._m = m = S(4)                                 # room for the focus ring
+        self._size = w, h = S(width), S(28)
+        super().__init__(parent, width=w + 2 * m, height=h + 2 * m, bg=bg, bd=0,
+                         highlightthickness=0, cursor="xterm")
         self._state, self._err_job = "rest", None
         self._img = self.create_image(0, 0, anchor="nw")
         self.entry = e = tk.Entry(self, font=F.body, bd=0, relief="flat", highlightthickness=0,
-                                  justify="right", fg=T.text, insertbackground=T.text,
+                                  justify="right", bg=T.field, fg=T.text, insertbackground=T.text,
                                   insertwidth=max(1, S(1)), selectbackground=T.accent,
                                   selectforeground=T.on_accent)
-        self.create_window(S(10), h // 2, window=e, anchor="w", width=w - S(20))
+        self.create_window(m + S(6), m + h // 2, window=e, anchor="w", width=w - S(12))
         e.bind("<Return>", on_enter)
         e.bind("<FocusIn>", lambda _e: self._set("focus"))
-        e.bind("<FocusOut>", lambda _e: self._set("hover" if _pointer_in(self) else "rest"))
-        for wdg in (self, e):
-            wdg.bind("<Enter>", lambda _e: self._state == "rest" and self._set("hover"))
-            wdg.bind("<Leave>", lambda _e: self._state == "hover" and not _pointer_in(self)
-                                           and self._set("rest"))
+        e.bind("<FocusOut>", lambda _e: self._set("rest"))
         self.bind("<Button-1>", lambda _e: e.focus_set())
         self._set("rest")
 
@@ -444,16 +590,17 @@ class _Field(tk.Canvas):
 
     def _set(self, state):
         self._state = state
-        fill = {"rest": T.ctl, "hover": T.ctl_hover, "focus": T.field_focus}[state]
+        (w, h), m = self._size, self._m
         if self._err_job:
-            band = (S(2), T.bad)
+            ring, edge = T.bad_ring, T.bad
         elif state == "focus":
-            band = (S(2), T.accent)
+            ring, edge = T.focus, T.accent
         else:
-            band = (BORDER, T.ctl_strong)
-        self.itemconfigure(self._img, image=_shape(*self._size, S(4),
-                           ((0, T.ctl_edge, 0), (BORDER, fill, 0)), band))
-        self.entry.configure(bg=fill)
+            ring, edge = None, T.field_edge
+        layers = ((m, edge, 0), (m + BORDER, T.field, 0))
+        if ring:
+            layers = ((m - S(3), ring, 0),) + layers
+        self.itemconfigure(self._img, image=_shape(w + 2 * m, h + 2 * m, S(6) + m, layers))
 
 
 class _Link(tk.Label):
@@ -462,7 +609,7 @@ class _Link(tk.Label):
     def __init__(self, parent, text, command, bg):
         self._fonts = (_font(F.caption), _font(F.caption, underline=True))
         super().__init__(parent, text=text, font=self._fonts[0], fg=T.link, bg=bg, bd=0,
-                         padx=0, pady=0, highlightthickness=0, cursor="hand2", takefocus=1)
+                         padx=0, pady=0, highlightthickness=0, takefocus=1)
         self._focused = False
         self.bind("<Button-1>", lambda _e: command())
         self.bind("<space>", lambda _e: command())
@@ -477,48 +624,31 @@ class _Link(tk.Label):
         self.configure(font=self._fonts[on])
 
 
-class _SettingRow(_Card):
-    """Settings card: title, description and a switch. Clicking anywhere on
-    the card flips the switch."""
+class _SettingRow(tk.Frame):
+    """Grouped-list row: title, description and a switch. Clicking anywhere
+    on the row flips the switch."""
 
     def __init__(self, parent, title, desc, on, command, link=None):
-        super().__init__(parent, T.bg)
-        b = self.body
-        b.grid_columnconfigure(0, weight=1)
-        b.grid_rowconfigure(0, weight=1)
-        text = _panel(b, T.card)
-        text.grid(row=0, column=0, sticky="w", padx=(S(16), S(12)), pady=S(11))
+        super().__init__(parent, bg=T.card, bd=0, highlightthickness=0)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        text = _panel(self, T.card)
+        text.grid(row=0, column=0, sticky="w", padx=(S(14), S(12)), pady=S(8))
         t = _label(text, title, F.body, T.text, T.card)
         t.pack(anchor="w")
         line = _panel(text, T.card)
         line.pack(anchor="w", pady=(S(1), 0))
         d = _label(line, desc, F.caption, T.text2, T.card)
         d.pack(side="left")
-        self.switch = _Switch(b, on, command, T.card)
-        self.switch.grid(row=0, column=1, padx=(0, S(12)))
-        self._painted = [text, line, t, d, self.switch]
-        hover = [b, text, line, t, d, self.switch]
-        for wdg in (b, text, line, t, d):
-            wdg.bind("<ButtonPress-1>", lambda _e: self.fill(T.card_press))
+        self.switch = _Switch(self, on, command, T.card)
+        self.switch.grid(row=0, column=1, padx=(0, S(10)))
+        for wdg in (self, text, line, t, d):
             wdg.bind("<ButtonRelease-1>", self._release)
         if link:
-            lk = _Link(line, link[0], link[1], T.card)
-            lk.pack(side="left", padx=(S(6), 0))
-            self._painted.append(lk)
-            hover.append(lk)
-        for wdg in hover:
-            wdg.bind("<Enter>", lambda _e: self.fill(T.card_hover), add="+")
-            wdg.bind("<Leave>", lambda _e: _pointer_in(self) or self.fill(T.card), add="+")
-
-    def fill(self, colour):
-        super().fill(colour)
-        for w in getattr(self, "_painted", ()):
-            w.configure(bg=colour)
+            _Link(line, link[0], link[1], T.card).pack(side="left", padx=(S(6), 0))
 
     def _release(self, _e):
-        inside = _pointer_in(self)
-        self.fill(T.card_hover if inside else T.card)
-        if inside:
+        if _pointer_in(self):
             self.switch.toggle()
 
 
@@ -643,7 +773,7 @@ class App(tk.Tk):
         for attr in TOGGLES:
             setattr(self, attr, _load_toggle(attr))
 
-        self._anim_seq = 0
+        self._jobs = {}
         self._knob_hover = False
         self._status_key = None
 
@@ -697,7 +827,7 @@ class App(tk.Tk):
     def _build_position_card(self, parent):
         card = _Card(parent, T.bg)
         b = card.body
-        p, m = S(16), S(3)
+        p, m = S(16), S(4)
         b.grid_columnconfigure(0, weight=1)
         b.grid_rowconfigure(0, weight=1)
         self._build_pad(b).grid(row=0, column=0, pady=(S(20), 0))
@@ -726,44 +856,52 @@ class App(tk.Tk):
         self._saved_cells = row(2, "Saved")
         self._show_saved(_load_start_pos())
 
-        m = S(3)
+        m = S(4)                    # control margin, room for focus rings
         _label(t, "Go to", F.body, T.text2, T.card).grid(row=3, column=0, sticky="w", pady=(S(8), 0))
         self._pan_field = _Field(t, 72, self._goto_coords, T.card)
-        self._pan_field.grid(row=3, column=1, sticky="e", padx=(S(8), 0), pady=(S(8), 0))
+        self._pan_field.grid(row=3, column=1, sticky="e", padx=(S(8) - m, 0), pady=(S(8) - m, 0))
         self._tilt_field = _Field(t, 72, self._goto_coords, T.card)
-        self._tilt_field.grid(row=3, column=2, sticky="e", padx=(S(8), 0), pady=(S(8), 0))
+        self._tilt_field.grid(row=3, column=2, sticky="e", padx=(S(8) - m, 0), pady=(S(8) - m, 0))
         self._go_btn = _Button(t, "Go", self._goto_coords, T.card)
         self._go_btn.grid(row=3, column=3, padx=(S(8) - m, 0), pady=(S(8) - m, 0))
         return t
 
     def _build_settings(self, parent):
-        stack = _panel(parent, T.bg)
-        stack.grid_columnconfigure(0, weight=1)
+        card = _Card(parent, T.bg)
+        b = card.body
+        b.grid_columnconfigure(0, weight=1)
+        last = len(TOGGLES) - 1
         for i, attr in enumerate(TOGGLES):
             _file, label, _default, desc = TOGGLES[attr]
             link = ("View endpoints", self._show_api_help) if attr == "_api_on" else None
-            row = _SettingRow(stack, label, desc, getattr(self, attr),
+            if i:
+                tk.Frame(b, bg=T.sep, height=BORDER, bd=0).grid(row=2 * i - 1, column=0,
+                                                               sticky="ew", padx=(S(14), 0))
+            row = _SettingRow(b, label, desc, getattr(self, attr),
                               lambda on, a=attr: self._set_toggle(a, on), link)
-            row.grid(row=i, column=0, sticky="nsew", pady=(S(4) if i else 0, 0))
-            stack.grid_rowconfigure(i, weight=1, uniform="rows")
-        return stack
+            row.grid(row=2 * i, column=0, sticky="nsew",
+                     pady=(S(2) if i == 0 else 0, S(2) if i == last else 0))
+            b.grid_rowconfigure(2 * i, weight=1, uniform="rows")
+        return card
 
     def _build_pad(self, parent):
-        D = S(176); c = D // 2
+        self._jr  = S(84)                       # well radius
+        self._jpk = S(22)                       # puck radius
+        self._jtr = self._jr - self._jpk - S(6)
+        wm, pm = S(10), S(12)                   # image margins for glow and shadow
+        D = 2 * (self._jr + wm)
+        c = D // 2
         cv = tk.Canvas(parent, width=D, height=D, bg=T.card, bd=0, highlightthickness=0)
         self._cv = cv
         self._jcx = self._jcy = c
-        self._jr  = D / 2
-        self._jpk = S(18)
-        self._jtr = self._jr - self._jpk - S(6)
-        cv.create_image(0, 0, anchor="nw", image=_shape(D, D, D / 2,
-                        ((0, T.well_edge, 0), (BORDER, T.well, 0))))
-        g = S(16)
-        cv.create_line(g, c, D - g, c, fill=T.well_line, width=BORDER)
-        cv.create_line(c, g, c, D - g, fill=T.well_line, width=BORDER)
-        self._knob = cv.create_image(c, c)
+        self._well_imgs = [ImageTk.PhotoImage(_well_img(self._jr, wm, a), master=cv)
+                           for a in (False, True)]
+        self._puck_imgs = [ImageTk.PhotoImage(_puck_img(self._jpk, pm, i / 4), master=cv)
+                           for i in range(5)]
+        self._well = cv.create_image(c, c, image=self._well_imgs[0])
+        self._knob = cv.create_image(c, c, image=self._puck_imgs[0])
         self._px, self._py = c, c
-        self._paint_knob()
+        self._puck_k = 0.0
         cv.bind("<ButtonPress-1>",   self._jdown)
         cv.bind("<B1-Motion>",       self._jmove)
         cv.bind("<ButtonRelease-1>", self._jup)
@@ -772,17 +910,35 @@ class App(tk.Tk):
         return cv
 
     def _paint_knob(self):
-        # Windows 11 slider-thumb style: the accent dot grows on hover and
-        # tightens while dragging
-        R = self._jpk
-        dot = S(6) if self._dragging else S(9) if self._knob_hover else S(7)
-        self._cv.itemconfigure(self._knob, image=_shape(2 * R, 2 * R, R,
-            ((0, T.knob_edge, 0), (BORDER, T.knob, 0), (R - dot, T.accent, 0))))
+        # the glass puck swells slightly on hover and more while dragging
+        target = 1.0 if self._dragging else 0.35 if self._knob_hover else 0.0
+        k0 = self._puck_k
+        def step(u):
+            self._puck_k = k0 + (target - k0) * u
+            self._cv.itemconfigure(self._knob, image=self._puck_imgs[round(self._puck_k * 4)])
+        self._animate("puck", 160, step)
 
     def _set_knob_hover(self, on):
         if on != self._knob_hover:
             self._knob_hover = on
             self._paint_knob()
+
+    def _animate(self, key, ms, step, ease=_ease_out):
+        job = self._jobs.pop(key, None)
+        if job:
+            self.after_cancel(job)
+        t0 = time.perf_counter()
+        def tick():
+            u = min(1.0, (time.perf_counter() - t0) * 1000.0 / ms)
+            try:
+                step(ease(u))
+            except tk.TclError:
+                return
+            if u < 1.0:
+                self._jobs[key] = self.after(12, tick)
+            else:
+                self._jobs.pop(key, None)
+        tick()
 
     def _show_saved(self, pos):
         for cell, v in zip(self._saved_cells, pos or (None, None)):
@@ -810,8 +966,11 @@ class App(tk.Tk):
         cx, cy = self._jcx, self._jcy
         if math.hypot(e.x - cx, e.y - cy) > self._jr:
             return
-        self._anim_seq += 1
+        job = self._jobs.pop("spring", None)
+        if job:
+            self.after_cancel(job)
         self._dragging = True
+        self._cv.itemconfigure(self._well, image=self._well_imgs[1])
         self._paint_knob()
         self._jset(e.x, e.y)
 
@@ -824,28 +983,17 @@ class App(tk.Tk):
             return
         self._dragging = False
         self._jx = 0.0; self._jy = 0.0
+        self._cv.itemconfigure(self._well, image=self._well_imgs[0])
         self._paint_knob()
-        self._anim_seq += 1
-        self._spring(self._anim_seq, self._px, self._py, 0)
+        sx, sy, cx, cy = self._px, self._py, self._jcx, self._jcy
+        self._animate("spring", 420,
+                      lambda u: self._move_puck_to(sx + (cx - sx) * u, sy + (cy - sy) * u),
+                      _ease_out_back)
 
     def _jhover(self, e):
         if self._dragging:
             return
-        inside = math.hypot(e.x - self._jcx, e.y - self._jcy) <= self._jr
-        self._cv.configure(cursor="fleur" if inside else "")
         self._set_knob_hover(math.hypot(e.x - self._px, e.y - self._py) <= self._jpk)
-
-    def _spring(self, seq, sx, sy, step):
-        if seq != self._anim_seq:
-            return
-        steps = 9
-        u = (step + 1) / steps
-        u = 1 - (1 - u) ** 3
-        nx = sx + (self._jcx - sx) * u
-        ny = sy + (self._jcy - sy) * u
-        self._move_puck_to(nx, ny)
-        if step + 1 < steps:
-            self.after(12, lambda: self._spring(seq, sx, sy, step + 1))
 
     def _jset(self, mx, my):
         cx, cy = self._jcx, self._jcy
@@ -947,7 +1095,7 @@ class App(tk.Tk):
         w.transient(self)
         _set_icon(w)
 
-        pad, m = S(24), S(3)
+        pad, m = S(24), S(4)
         f = _panel(w, T.bg)
         f.pack(fill="both", expand=True, padx=(pad, pad - m), pady=(S(20), pad - m))
         _label(f, "Local API", F.title, T.text, T.bg).pack(anchor="w")

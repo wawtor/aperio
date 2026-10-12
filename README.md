@@ -55,7 +55,7 @@ Run `research/diag.py` to check compatibility on your hardware.
 
 - Windows 10/11
 - Python 3.10+ — only needed for `aperio.py` (the setup GUI)
-- `hidapi` Python package: `pip install hidapi`
+- `hidapi` and `pillow` Python packages: `pip install hidapi pillow`
 - Rust toolchain — only needed if building `aperio.exe` from source
 
 ---
@@ -216,7 +216,7 @@ copy is saved.)
 ## Testing Another Camera
 
 ```
-pip install hidapi
+pip install hidapi pillow
 
 # List all HID devices to find your camera's VID and PID
 python research/diag.py --list
